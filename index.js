@@ -1,4 +1,4 @@
- const express = require('express');
+const express = require('express');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -20,47 +20,32 @@ const HEADERS = {
 };
 
 // =============================================
-// HÀM FETCH API (CÓ RETRY)
+// HÀM FETCH API
 // =============================================
 async function fetchBetVipHistory(retries = 3) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
             console.log(`🔄 Lần thử ${attempt}/${retries}...`);
-            
-            const response = await fetch(API_URL, { 
-                headers: HEADERS,
-                timeout: 10000
-            });
-            
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-            }
-            
+            const response = await fetch(API_URL, { headers: HEADERS, timeout: 10000 });
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const data = await response.json();
-            
             if (data && data.list && data.list.length > 0) {
                 console.log(`✅ Lấy dữ liệu BetVip thành công! (${data.list.length} records)`);
                 return data;
-            } else {
-                throw new Error('Dữ liệu trống hoặc không hợp lệ');
             }
-            
+            throw new Error('Dữ liệu trống');
         } catch (error) {
             console.warn(`⚠️ Lần ${attempt} thất bại: ${error.message}`);
-            
-            if (attempt === retries) {
-                throw new Error(`Không thể lấy dữ liệu từ BetVip sau ${retries} lần thử. Lỗi: ${error.message}`);
-            }
-            
+            if (attempt === retries) throw new Error(`Không thể lấy dữ liệu từ BetVip: ${error.message}`);
             await new Promise(resolve => setTimeout(resolve, 2000));
         }
     }
 }
 
 // =============================================
-// THUẬT TOÁN LC79 PREDICTOR
+// THUẬT TOÁN PREDICTOR
 // =============================================
-class LC79Predictor {
+class BetVipPredictor {
     constructor() {
         this.patterns = new Map();
         this.totalPred = 0;
@@ -93,7 +78,6 @@ class LC79Predictor {
             let results = clean.map(h => h.result);
             let len = results.length;
             let last = results[len - 1];
-            
             this.learn(results);
             
             let scores = { T: 0, X: 0 };
@@ -205,8 +189,7 @@ class LC79Predictor {
                 shouldBet: confidence >= 60 && this.consecutiveLosses < 3,
                 signals,
                 pattern: signals.slice(0, 5).join(' | '),
-                reason: signals.join(' | '),
-                message: signals.join(' | ')
+                reason: signals.join(' | ')
             };
         } catch (error) {
             return { result: null, confidence: 0, status: 'ERROR', message: error.message };
@@ -232,7 +215,7 @@ class LC79Predictor {
 // =============================================
 // KHỞI TẠO
 // =============================================
-const predictor = new LC79Predictor();
+const predictor = new BetVipPredictor();
 let lastPrediction = null;
 let betVipHistory = [];
 
@@ -268,17 +251,9 @@ app.get('/api/betvip/history', async (req, res) => {
             id: item.id
         }));
         betVipHistory = history;
-        res.json({ 
-            status: 'OK', 
-            data: history, 
-            count: history.length
-        });
+        res.json({ status: 'OK', data: history, count: history.length });
     } catch (error) {
-        console.error('❌ Lỗi fetch API BetVip:', error.message);
-        res.status(503).json({ 
-            status: 'ERROR', 
-            message: error.message
-        });
+        res.status(503).json({ status: 'ERROR', message: error.message });
     }
 });
 
@@ -294,20 +269,11 @@ app.get('/api/betvip/predict', async (req, res) => {
                 id: item.id
             }));
         }
-
         const result = predictor.predict(betVipHistory);
         lastPrediction = result.result;
-        res.json({ 
-            ...result, 
-            historyCount: betVipHistory.length,
-            lastId: betVipHistory[0]?.id 
-        });
+        res.json({ ...result, historyCount: betVipHistory.length });
     } catch (error) {
-        console.error('❌ Lỗi dự đoán:', error.message);
-        res.status(503).json({ 
-            status: 'ERROR', 
-            message: error.message
-        });
+        res.status(503).json({ status: 'ERROR', message: error.message });
     }
 });
 
@@ -337,10 +303,6 @@ app.get('/api/betvip/accuracy', (req, res) => {
     });
 });
 
-// =============================================
-// KHỞI ĐỘNG SERVER
-// =============================================
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 BetVip Predictor Server chạy trên port ${PORT}`);
-    console.log(`📊 Test: http://localhost:${PORT}/api/betvip/predict`);
 });
