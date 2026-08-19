@@ -1,9 +1,11 @@
-# [Project name]
+# Blank Node.js Project
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+A minimal Node.js project with a runnable entry point.
 
 ## Run & Operate
 
+- `pnpm start` — run the project
+- `pnpm dev` — run the project with Node's watch mode
 - `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
 - `pnpm run typecheck` — full typecheck across all packages
 - `pnpm run build` — typecheck + build all packages
