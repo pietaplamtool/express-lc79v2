@@ -3,30 +3,26 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // =============================================
-// ULTIMATE AUTO FETCH & AI PREDICTOR
+// ULTIMATE AI PREDICTOR - BETVIP
 // =============================================
 
 class UltimatePredictor {
     constructor() {
         this.apiConfig = {
-            baseUrl: 'https://wtxmd52.tele68.com/v1/txmd5/lite-sessions',
-            token: '2f9251283c3748d5e0f0528c1eeac6de',
+            baseUrl: 'https://wtxmd52.macminim6.online/v1/txmd5/sessions',
+            token: '1fc7bfdeab18790088a6e44d6b8cb288',
             params: 'cp=R&cl=R&pf=web&at=',
             pollInterval: 4000
         };
         this.history = [];
         this.maxHistory = 200;
-        this.sessionData = [];
-        this.patterns = [];
         this.stats = {
             totalPredictions: 0,
             correctPredictions: 0,
             accuracy: 0,
             streaks: { current: 0, best: 0 }
         };
-        this.isRunning = false;
         this.lastPrediction = null;
-        this.lastResult = null;
         this.weights = {
             bệt: 1.0, đảo: 0.8, cầu21: 0.7, cầu31: 0.6,
             tầnSuất: 0.5, fibonacci: 0.4, martingale: 0.3,
@@ -35,25 +31,33 @@ class UltimatePredictor {
         this.predictionHistory = [];
     }
 
+    // =============================================
+    // FETCH DỮ LIỆU TỪ BETVIP
+    // =============================================
     async fetchData() {
         try {
             const url = `${this.apiConfig.baseUrl}?${this.apiConfig.params}${this.apiConfig.token}`;
-            console.log('📡 Đang lấy dữ liệu từ API...');
+            console.log('📡 Đang lấy dữ liệu từ BetVip...');
+            
             const response = await fetch(url, {
                 method: 'GET',
                 headers: {
                     'Content-Type': 'application/json',
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Accept': 'application/json',
-                    'Origin': 'https://lc79.com',
-                    'Referer': 'https://lc79.com/'
+                    'Origin': 'https://betvip.com',
+                    'Referer': 'https://betvip.com/'
                 }
             });
+            
             if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
             const data = await response.json();
-            if (data && data.sessions) {
-                this.processSessions(data.sessions);
-                return data.sessions;
+            
+            // Xử lý dữ liệu (hỗ trợ cả list và sessions)
+            const sessions = data.list || data.sessions || [];
+            if (sessions.length > 0) {
+                this.processData(sessions);
+                return sessions;
             }
             return null;
         } catch (error) {
@@ -62,21 +66,30 @@ class UltimatePredictor {
         }
     }
 
-    processSessions(sessions) {
-        if (!sessions || sessions.length === 0) return;
-        this.sessionData = sessions;
+    processData(sessions) {
+        let count = 0;
         sessions.forEach(session => {
-            if (session && session.result) {
-                const result = session.result;
-                if (this.history.length === 0 || this.history[this.history.length - 1] !== result) {
-                    this.history.push(result);
-                    if (this.history.length > this.maxHistory) this.history.shift();
-                }
+            // Lấy kết quả từ resultTruyenThong (BetVip) hoặc result (LC79)
+            const raw = session.resultTruyenThong || session.result;
+            if (!raw) return;
+            
+            let result = raw;
+            if (raw === 'TAI') result = 'T';
+            else if (raw === 'XIU') result = 'X';
+            else if (raw !== 'T' && raw !== 'X') return;
+            
+            if (this.history.length === 0 || this.history[this.history.length - 1] !== result) {
+                this.history.push(result);
+                if (this.history.length > this.maxHistory) this.history.shift();
+                count++;
             }
         });
+        console.log(`✅ Đã cập nhật ${count} kết quả mới`);
     }
 
+    // =============================================
     // CÁC THUẬT TOÁN PHÂN TÍCH
+    // =============================================
     detectBệt() {
         if (this.history.length < 3) return null;
         const last3 = this.history.slice(-3);
@@ -107,32 +120,30 @@ class UltimatePredictor {
 
     detectCầu21() {
         if (this.history.length < 6) return null;
-        const last6 = this.history.slice(-6);
-        const pattern = last6.join('');
-        const patterns = {
+        const pattern = this.history.slice(-6).join('');
+        const maps = {
             'TTXTTX': { result: 'T', strength: 0.7 },
             'XXTXXT': { result: 'X', strength: 0.7 },
             'TXXTXX': { result: 'T', strength: 0.65 },
             'XTTXTT': { result: 'X', strength: 0.65 }
         };
-        if (patterns[pattern]) {
-            return { result: patterns[pattern].result, pattern: `Cầu 2-1 (${pattern})`, strength: patterns[pattern].strength };
+        if (maps[pattern]) {
+            return { result: maps[pattern].result, pattern: `Cầu 2-1 (${pattern})`, strength: maps[pattern].strength };
         }
         return null;
     }
 
     detectCầu31() {
         if (this.history.length < 8) return null;
-        const last8 = this.history.slice(-8);
-        const pattern = last8.join('');
-        const patterns = {
+        const pattern = this.history.slice(-8).join('');
+        const maps = {
             'TTTXTTTX': { result: 'T', strength: 0.6 },
             'XXXTXXXT': { result: 'X', strength: 0.6 },
             'TXTTTXTT': { result: 'T', strength: 0.55 },
             'XTXXXTXX': { result: 'X', strength: 0.55 }
         };
-        if (patterns[pattern]) {
-            return { result: patterns[pattern].result, pattern: `Cầu 3-1 (${pattern})`, strength: patterns[pattern].strength };
+        if (maps[pattern]) {
+            return { result: maps[pattern].result, pattern: `Cầu 3-1 (${pattern})`, strength: maps[pattern].strength };
         }
         return null;
     }
@@ -141,37 +152,28 @@ class UltimatePredictor {
         if (this.history.length < 20) return null;
         const last20 = this.history.slice(-20);
         const last50 = this.history.slice(-50);
-        const tCount20 = last20.filter(r => r === 'T').length;
-        const xCount20 = last20.filter(r => r === 'X').length;
-        const tPercent20 = (tCount20 / 20) * 100;
-        const xPercent20 = (xCount20 / 20) * 100;
-        if (Math.abs(tPercent20 - xPercent20) > 20) {
-            const result = tPercent20 > xPercent20 ? 'X' : 'T';
-            const strength = Math.abs(tPercent20 - xPercent20) / 100;
-            return { result, pattern: 'Cân bằng tần suất', strength: Math.min(strength, 0.7) };
+        const t20 = last20.filter(r => r === 'T').length;
+        const x20 = 20 - t20;
+        const diff = Math.abs(t20 - x20);
+        if (diff > 4) {
+            const result = t20 > x20 ? 'X' : 'T';
+            return { result, pattern: 'Cân bằng tần suất', strength: Math.min(diff / 20, 0.7) };
         }
-        const tCount50 = last50.filter(r => r === 'T').length;
-        const tPercent50 = (tCount50 / last50.length) * 100;
-        if (tPercent50 > 55) return { result: 'T', pattern: 'Xu hướng Tài', strength: 0.4 };
-        if (tPercent50 < 45) return { result: 'X', pattern: 'Xu hướng Xỉu', strength: 0.4 };
+        const t50 = last50.filter(r => r === 'T').length;
+        const p50 = t50 / last50.length;
+        if (p50 > 0.55) return { result: 'T', pattern: 'Xu hướng Tài', strength: 0.4 };
+        if (p50 < 0.45) return { result: 'X', pattern: 'Xu hướng Xỉu', strength: 0.4 };
         return null;
     }
 
     analyzeFibonacci() {
         if (this.history.length < 13) return null;
-        const fibPositions = [2, 3, 5, 8, 13];
-        const lastResult = this.history[this.history.length - 1];
-        let matches = 0, total = 0;
-        fibPositions.forEach(pos => {
-            if (this.history.length >= pos) {
-                total++;
-                if (this.history[this.history.length - pos] === lastResult) matches++;
-            }
-        });
-        const matchRatio = matches / total;
-        if (matchRatio > 0.6) {
-            const nextResult = lastResult === 'T' ? 'X' : 'T';
-            return { result: nextResult, pattern: 'Fibonacci pattern', strength: matchRatio * 0.5 };
+        const pos = [2, 3, 5, 8, 13];
+        const last = this.history[this.history.length - 1];
+        let matches = 0;
+        pos.forEach(p => { if (this.history[this.history.length - p] === last) matches++; });
+        if (matches / pos.length > 0.6) {
+            return { result: last === 'T' ? 'X' : 'T', pattern: 'Fibonacci', strength: (matches / pos.length) * 0.5 };
         }
         return null;
     }
@@ -179,10 +181,9 @@ class UltimatePredictor {
     analyzeMartingale() {
         if (this.history.length < 5) return null;
         const last5 = this.history.slice(-5);
-        const tCount = last5.filter(r => r === 'T').length;
-        const xCount = last5.filter(r => r === 'X').length;
-        if (tCount >= 4) return { result: 'X', pattern: 'Martingale ngược', strength: 0.35 };
-        if (xCount >= 4) return { result: 'T', pattern: 'Martingale ngược', strength: 0.35 };
+        const t = last5.filter(r => r === 'T').length;
+        if (t >= 4) return { result: 'X', pattern: 'Martingale ngược', strength: 0.35 };
+        if (t <= 1) return { result: 'T', pattern: 'Martingale ngược', strength: 0.35 };
         return null;
     }
 
@@ -190,92 +191,95 @@ class UltimatePredictor {
         if (this.history.length < 10) return null;
         const last10 = this.history.slice(-10);
         const last30 = this.history.slice(-30);
-        const tProb10 = last10.filter(r => r === 'T').length / 10;
-        const tProb30 = last30.filter(r => r === 'T').length / 30;
-        const combinedProb = (tProb10 * 0.6) + (tProb30 * 0.4);
-        if (combinedProb > 0.55) return { result: 'T', pattern: 'ML xu hướng', strength: combinedProb * 0.8 };
-        if (combinedProb < 0.45) return { result: 'X', pattern: 'ML xu hướng', strength: (1 - combinedProb) * 0.8 };
+        const p = (last10.filter(r => r === 'T').length / 10) * 0.6 + (last30.filter(r => r === 'T').length / 30) * 0.4;
+        if (p > 0.55) return { result: 'T', pattern: 'ML xu hướng', strength: p * 0.8 };
+        if (p < 0.45) return { result: 'X', pattern: 'ML xu hướng', strength: (1 - p) * 0.8 };
         return null;
     }
 
     neuralNetwork() {
         if (this.history.length < 20) return null;
-        const last20 = this.history.slice(-20);
-        const input = last20.map(r => r === 'T' ? 1 : 0);
-        const hiddenLayer = input.map((x, i) => x * (Math.sin(i * 0.5) * 0.3 + 0.5));
-        const sum = hiddenLayer.reduce((a, b) => a + b, 0);
-        const average = sum / hiddenLayer.length;
-        if (average > 0.55) return { result: 'T', pattern: 'Neural Network', strength: average * 0.7 };
-        if (average < 0.45) return { result: 'X', pattern: 'Neural Network', strength: (1 - average) * 0.7 };
+        const input = this.history.slice(-20).map(r => r === 'T' ? 1 : 0);
+        const sum = input.reduce((s, x, i) => s + x * (Math.sin(i * 0.5) * 0.3 + 0.5), 0);
+        const avg = sum / input.length;
+        if (avg > 0.55) return { result: 'T', pattern: 'Neural', strength: avg * 0.7 };
+        if (avg < 0.45) return { result: 'X', pattern: 'Neural', strength: (1 - avg) * 0.7 };
         return null;
     }
 
     patternMatching() {
         if (this.history.length < 15) return null;
-        const last15 = this.history.slice(-15);
-        const pattern = last15.join('');
-        const allPatterns = [];
-        for (let i = 0; i <= this.history.length - 15; i++) {
-            const subPattern = this.history.slice(i, i + 15).join('');
-            if (subPattern === pattern) allPatterns.push(i);
+        const pattern = this.history.slice(-15).join('');
+        let lastMatch = -1;
+        for (let i = 0; i <= this.history.length - 16; i++) {
+            if (this.history.slice(i, i + 15).join('') === pattern) lastMatch = i;
         }
-        if (allPatterns.length > 0) {
-            const lastMatch = allPatterns[allPatterns.length - 1];
-            const nextResult = this.history[lastMatch + 15];
-            if (nextResult) return { result: nextResult, pattern: 'Pattern matching', strength: 0.5 };
+        if (lastMatch >= 0 && this.history[lastMatch + 15]) {
+            return { result: this.history[lastMatch + 15], pattern: 'Pattern match', strength: 0.5 };
         }
         return null;
     }
 
+    // =============================================
     // TỔNG HỢP DỰ ĐOÁN
+    // =============================================
     predict() {
         if (this.history.length < 5) {
-            return { prediction: null, message: 'Cần ít nhất 5 phiên', confidence: 0 };
+            return { 
+                prediction: null, 
+                message: `Cần ít nhất 5 phiên (hiện có ${this.history.length})`, 
+                confidence: 0 
+            };
         }
 
-        const predictions = [];
-        const bệt = this.detectBệt();
-        const cầuĐảo = this.detectCầuĐảo();
-        const cầu21 = this.detectCầu21();
-        const cầu31 = this.detectCầu31();
-        const tầnSuất = this.analyzeTầnSuất();
-        const fibonacci = this.analyzeFibonacci();
-        const martingale = this.analyzeMartingale();
-        const ml = this.simpleML();
-        const neural = this.neuralNetwork();
-        const pattern = this.patternMatching();
+        const methods = [
+            this.detectBệt(), this.detectCầuĐảo(), this.detectCầu21(), this.detectCầu31(),
+            this.analyzeTầnSuất(), this.analyzeFibonacci(), this.analyzeMartingale(),
+            this.simpleML(), this.neuralNetwork(), this.patternMatching()
+        ];
+        const valid = methods.filter(m => m);
+        
+        if (valid.length < 2) {
+            const last = this.history[this.history.length - 1];
+            const pred = last === 'T' ? 'X' : 'T';
+            this.lastPrediction = pred;
+            this.stats.totalPredictions++;
+            return { 
+                prediction: pred, 
+                confidence: 50, 
+                patterns: ['Random - thiếu pattern'],
+                message: 'Ít pattern, dự đoán ngược'
+            };
+        }
 
-        if (bệt) predictions.push({...bệt, weight: this.weights.bệt});
-        if (cầuĐảo) predictions.push({...cầuĐảo, weight: this.weights.đảo});
-        if (cầu21) predictions.push({...cầu21, weight: this.weights.cầu21});
-        if (cầu31) predictions.push({...cầu31, weight: this.weights.cầu31});
-        if (tầnSuất) predictions.push({...tầnSuất, weight: this.weights.tầnSuất});
-        if (fibonacci) predictions.push({...fibonacci, weight: this.weights.fibonacci});
-        if (martingale) predictions.push({...martingale, weight: this.weights.martingale});
-        if (ml) predictions.push({...ml, weight: this.weights.ml});
-        if (neural) predictions.push({...neural, weight: this.weights.neural});
-        if (pattern) predictions.push({...pattern, weight: this.weights.pattern});
-
-        let tScore = 0, xScore = 0, totalWeight = 0;
-        predictions.forEach(p => {
-            const weightedScore = p.strength * p.weight;
-            if (p.result === 'T') tScore += weightedScore;
-            else xScore += weightedScore;
-            totalWeight += weightedScore;
+        let tScore = 0, xScore = 0;
+        const patterns = [];
+        valid.forEach(m => {
+            patterns.push(m.pattern);
+            const score = m.strength * (this.weights[m.pattern.split(' ')[0].toLowerCase()] || 0.5);
+            if (m.result === 'T') tScore += score;
+            else xScore += score;
         });
 
-        const confidence = totalWeight > 0 ? (Math.abs(tScore - xScore) / totalWeight) * 100 : 0;
+        const totalScore = tScore + xScore;
+        const confidence = totalScore > 0 ? (Math.abs(tScore - xScore) / totalScore) * 100 : 0;
         const finalResult = tScore > xScore ? 'T' : 'X';
 
-        if (confidence < 25 || predictions.length < 2) {
-            return { prediction: null, message: 'Độ tin cậy thấp, nên bỏ qua', confidence, patterns: predictions.map(p => p.pattern) };
+        if (confidence < 25) {
+            return { 
+                prediction: null, 
+                message: 'Độ tin cậy thấp (<25%), bỏ qua phiên này', 
+                confidence, 
+                patterns,
+                scores: { T: tScore, X: xScore }
+            };
         }
 
         const result = {
             prediction: finalResult,
             confidence: Math.min(confidence, 95),
-            patterns: predictions.map(p => p.pattern),
-            tScore, xScore,
+            patterns,
+            scores: { T: tScore.toFixed(2), X: xScore.toFixed(2) },
             history: this.history.slice(-10),
             timestamp: new Date().toISOString()
         };
@@ -319,7 +323,7 @@ class UltimatePredictor {
 }
 
 // =============================================
-// KHỞI TẠO PREDICTOR
+// KHỞI TẠO
 // =============================================
 const predictor = new UltimatePredictor();
 
@@ -349,7 +353,12 @@ app.get('/api/health', (req, res) => {
 app.get('/api/fetch', async (req, res) => {
     try {
         const data = await predictor.fetchData();
-        res.json({ status: 'OK', message: 'Đã fetch dữ liệu', count: predictor.history.length });
+        res.json({ 
+            status: 'OK', 
+            message: 'Đã fetch dữ liệu', 
+            count: predictor.history.length,
+            history: predictor.history.slice(-10)
+        });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -396,6 +405,6 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Ultimate AI Predictor chạy trên port ${PORT}`);
     console.log('📡 Đang fetch dữ liệu ban đầu...');
     predictor.fetchData().then(() => {
-        console.log('✅ Dữ liệu ban đầu đã sẵn sàng!');
+        console.log(`✅ Dữ liệu sẵn sàng! (${predictor.history.length} records)`);
     });
 });
