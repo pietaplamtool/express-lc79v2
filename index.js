@@ -3,9 +3,17 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // =============================================
-// CẤU HÌNH API BETVIP
+// CẤU HÌNH API BETVIP + PROXY
 // =============================================
 const API_URL = 'https://wtxmd52.macminim6.online/v1/txmd5/sessions?cp=R&cl=R&pf=web&at=1fc7bfdeab18790088a6e44d6b8cb288&limit=200';
+
+// Proxy dự phòng (nếu API chặn IP Render)
+const PROXY_URLS = [
+    null, // Thử trực tiếp trước
+    'https://cors-anywhere.herokuapp.com/',
+    'https://api.allorigins.win/raw?url=',
+    'https://corsproxy.io/?'
+];
 
 const HEADERS = {
     'Content-Type': 'application/json',
@@ -16,30 +24,62 @@ const HEADERS = {
     'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
     'Accept-Encoding': 'gzip, deflate, br',
     'Connection': 'keep-alive',
-    'Cache-Control': 'no-cache'
+    'Cache-Control': 'no-cache',
+    'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    'Sec-Ch-Ua-Mobile': '?0',
+    'Sec-Ch-Ua-Platform': '"Windows"',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'cross-site',
+    'Pragma': 'no-cache'
 };
 
 // =============================================
-// HÀM FETCH API
+// HÀM FETCH VỚI PROXY + RETRY
 // =============================================
-async function fetchBetVipHistory(retries = 3) {
+async function fetchBetVipData(retries = 3) {
+    let lastError = null;
+    
     for (let attempt = 1; attempt <= retries; attempt++) {
-        try {
-            console.log(`🔄 Lần thử ${attempt}/${retries}...`);
-            const response = await fetch(API_URL, { headers: HEADERS, timeout: 10000 });
-            if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            const data = await response.json();
-            if (data && data.list && data.list.length > 0) {
-                console.log(`✅ Lấy dữ liệu BetVip thành công! (${data.list.length} records)`);
-                return data;
+        for (const proxy of PROXY_URLS) {
+            try {
+                const url = proxy ? proxy + encodeURIComponent(API_URL) : API_URL;
+                console.log(`🔄 Thử ${proxy ? 'Proxy' : 'Direct'} (lần ${attempt})...`);
+                
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), 15000);
+                
+                const response = await fetch(url, {
+                    headers: HEADERS,
+                    signal: controller.signal
+                });
+                clearTimeout(timeout);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                }
+                
+                const data = await response.json();
+                
+                if (data && data.list && data.list.length > 0) {
+                    console.log(`✅ Thành công! (${data.list.length} records)`);
+                    return data;
+                } else {
+                    throw new Error('Dữ liệu trống hoặc không hợp lệ');
+                }
+                
+            } catch (error) {
+                console.warn(`⚠️ ${proxy ? 'Proxy' : 'Direct'} thất bại: ${error.message}`);
+                lastError = error;
+                // Chờ 1s trước khi thử proxy khác
+                await new Promise(resolve => setTimeout(resolve, 1000));
             }
-            throw new Error('Dữ liệu trống');
-        } catch (error) {
-            console.warn(`⚠️ Lần ${attempt} thất bại: ${error.message}`);
-            if (attempt === retries) throw new Error(`Không thể lấy dữ liệu từ BetVip: ${error.message}`);
-            await new Promise(resolve => setTimeout(resolve, 2000));
         }
+        // Đợi 2s trước khi thử lại vòng mới
+        await new Promise(resolve => setTimeout(resolve, 2000));
     }
+    
+    throw new Error(`Không thể lấy dữ liệu sau ${retries} lần thử. Lỗi cuối: ${lastError ? lastError.message : 'Unknown'}`);
 }
 
 // =============================================
@@ -78,6 +118,7 @@ class BetVipPredictor {
             let results = clean.map(h => h.result);
             let len = results.length;
             let last = results[len - 1];
+            
             this.learn(results);
             
             let scores = { T: 0, X: 0 };
@@ -243,7 +284,7 @@ app.get('/api/health', (req, res) => {
 
 app.get('/api/betvip/history', async (req, res) => {
     try {
-        const data = await fetchBetVipHistory();
+        const data = await fetchBetVipData();
         const history = data.list.map(item => ({
             result: item.resultTruyenThong === 'TAI' ? 'T' : 'X',
             dices: item.dices,
@@ -253,6 +294,7 @@ app.get('/api/betvip/history', async (req, res) => {
         betVipHistory = history;
         res.json({ status: 'OK', data: history, count: history.length });
     } catch (error) {
+        console.error('❌ Lỗi:', error.message);
         res.status(503).json({ status: 'ERROR', message: error.message });
     }
 });
@@ -261,7 +303,7 @@ app.get('/api/betvip/predict', async (req, res) => {
     try {
         const forceRefresh = req.query.refresh === 'true';
         if (betVipHistory.length === 0 || forceRefresh) {
-            const data = await fetchBetVipHistory();
+            const data = await fetchBetVipData();
             betVipHistory = data.list.map(item => ({
                 result: item.resultTruyenThong === 'TAI' ? 'T' : 'X',
                 dices: item.dices,
@@ -273,6 +315,7 @@ app.get('/api/betvip/predict', async (req, res) => {
         lastPrediction = result.result;
         res.json({ ...result, historyCount: betVipHistory.length });
     } catch (error) {
+        console.error('❌ Lỗi dự đoán:', error.message);
         res.status(503).json({ status: 'ERROR', message: error.message });
     }
 });
@@ -303,6 +346,9 @@ app.get('/api/betvip/accuracy', (req, res) => {
     });
 });
 
+// =============================================
+// KHỞI ĐỘNG SERVER
+// =============================================
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 BetVip Predictor Server chạy trên port ${PORT}`);
 });
