@@ -121,6 +121,39 @@ def predict():
     except Exception as e:
         return jsonify({'predict': 'XIU', 'confidence': 0.5})
 
+@app.route('/stats')
+def stats():
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM sessions')
+        total = cur.fetchone()[0]
+        cur.execute('SELECT COUNT(*) FROM sessions WHERE result = \'TAI\'')
+        tai = cur.fetchone()[0]
+        cur.execute('SELECT COUNT(*) FROM sessions WHERE result = \'XIU\'')
+        xiu = cur.fetchone()[0]
+        conn.close()
+        
+        # Kiểm tra model đã train chưa
+        model_ready = False
+        try:
+            import joblib
+            joblib.load('models/hmm.pkl')
+            joblib.load('models/xgb.pkl')
+            model_ready = True
+        except:
+            pass
+        
+        return jsonify({
+            'total_records': total,
+            'tai': tai,
+            'xiu': xiu,
+            'model_ready': model_ready,
+            'status': 'running' if total > 0 else 'waiting_for_data'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'status': 'db_error'})
+
 def background_worker():
     init_db()
     while True:
