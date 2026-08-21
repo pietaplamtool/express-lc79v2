@@ -134,10 +134,8 @@ def stats():
         xiu = cur.fetchone()[0]
         conn.close()
         
-        # Kiểm tra model đã train chưa
         model_ready = False
         try:
-            import joblib
             joblib.load('models/hmm.pkl')
             joblib.load('models/xgb.pkl')
             model_ready = True
@@ -153,6 +151,63 @@ def stats():
         })
     except Exception as e:
         return jsonify({'error': str(e), 'status': 'db_error'})
+
+# ================== ENDPOINT MỚI: TỈ LỆ THẮNG ==================
+@app.route('/accuracy')
+def accuracy():
+    try:
+        conn = get_db()
+        df = pd.read_sql('SELECT * FROM sessions ORDER BY id DESC LIMIT 500', conn)
+        conn.close()
+        
+        if len(df) < 10:
+            return jsonify({'error': 'Not enough data', 'total': len(df)})
+        
+        df = df.sort_values('id').reset_index(drop=True)
+        df['label'] = (df['result'] == 'TAI').astype(int)
+        for lag in range(1, 6):
+            df[f'lag_{lag}'] = df['label'].shift(lag).fillna(0)
+        df['rolling_mean'] = df['label'].rolling(10).mean().fillna(0.5)
+        df['point_diff'] = df['point'].diff().fillna(0)
+        df = df.dropna().reset_index(drop=True)
+        
+        hmm_model, xgb_model = load_models()
+        if hmm_model is None:
+            return jsonify({'error': 'Model not ready'})
+        
+        correct = 0
+        total = 0
+        correct_high = 0
+        high_count = 0
+        
+        for i in range(len(df) - 1):
+            X = df.iloc[i][['point', 'rolling_mean', 'point_diff'] + [f'lag_{i}' for i in range(1,6)]].values.reshape(1, -1)
+            actual = df.iloc[i+1]['label']
+            
+            prob_hmm = hmm_model.predict_proba(X)[0][1]
+            prob_xgb = xgb_model.predict_proba(X)[0][1]
+            prob_final = 0.4*prob_hmm + 0.6*prob_xgb
+            confidence = abs(prob_final - 0.5) * 2
+            pred = 1 if prob_final >= 0.5 else 0
+            
+            total += 1
+            if pred == actual:
+                correct += 1
+            if confidence >= 0.7:
+                high_count += 1
+                if pred == actual:
+                    correct_high += 1
+        
+        return jsonify({
+            'total_samples': total,
+            'accuracy': round(correct / total * 100, 2) if total > 0 else 0,
+            'high_conf_accuracy': round(correct_high / high_count * 100, 2) if high_count > 0 else 0,
+            'high_conf_count': high_count,
+            'status': 'ready'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+# ==========================================================
 
 def background_worker():
     init_db()
