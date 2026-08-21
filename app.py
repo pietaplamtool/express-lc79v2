@@ -2,13 +2,9 @@ import requests, psycopg2, redis, os, time, threading, json
 import numpy as np, pandas as pd
 from flask import Flask, jsonify
 from dotenv import load_dotenv
-from datetime import datetime
-from sklearn.preprocessing import LabelEncoder
-from xgboost import XGBClassifier
 from hmmlearn import hmm
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-import joblib
+from xgboost import XGBClassifier
+import joblib, pickle
 
 load_dotenv()
 app = Flask(__name__)
@@ -16,8 +12,8 @@ app = Flask(__name__)
 DB_URL = os.getenv('DB_URL')
 REDIS_URL = os.getenv('REDIS_URL')
 API_URL = os.getenv('API_URL')
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', 5))
-RETRAIN_EVERY = int(os.getenv('RETRAIN_EVERY', 200))
+POLL_INTERVAL = 5
+RETRAIN_EVERY = 200
 
 def get_db():
     return psycopg2.connect(DB_URL)
@@ -60,15 +56,15 @@ def fetch_and_save():
         r.set('last_id', latest_id)
         print(f'[+] Saved {len(new_records)} records')
     except Exception as e:
-        print(f'[-] Error: {e}')
+        print(f'[-] Fetch error: {e}')
 
 def train_models():
     try:
         conn = get_db()
-        df = pd.read_sql('SELECT * FROM sessions ORDER BY id DESC LIMIT 5000', conn)
+        df = pd.read_sql('SELECT * FROM sessions ORDER BY id DESC LIMIT 3000', conn)
         conn.close()
-        if len(df) < 100:
-            print('[-] Not enough data to train')
+        if len(df) < 50:
+            print('[-] Not enough data')
             return
         df = df.sort_values('id').reset_index(drop=True)
         df['label'] = (df['result'] == 'TAI').astype(int)
@@ -79,38 +75,36 @@ def train_models():
         df = df.dropna().reset_index(drop=True)
         X = df[['point', 'rolling_mean', 'point_diff'] + [f'lag_{i}' for i in range(1,6)]].values
         y = df['label'].values
-        # Train XGB
-        xgb = XGBClassifier(n_estimators=50, max_depth=5, use_label_encoder=False)
+        xgb = XGBClassifier(n_estimators=30, max_depth=3, use_label_encoder=False)
         xgb.fit(X, y)
-        # Train HMM
-        hmm_model = hmm.GaussianHMM(n_components=2, covariance_type='full', n_iter=50)
+        hmm_model = hmm.GaussianHMM(n_components=2, covariance_type='full', n_iter=30)
         hmm_model.fit(X)
-        # Save models
         os.makedirs('models', exist_ok=True)
         joblib.dump(hmm_model, 'models/hmm.pkl')
         joblib.dump(xgb, 'models/xgb.pkl')
-        print('[+] Models trained successfully')
+        print('[+] Models trained')
     except Exception as e:
         print(f'[-] Train error: {e}')
 
 def load_models():
-    global hmm_model, xgb_model
     try:
         hmm_model = joblib.load('models/hmm.pkl')
         xgb_model = joblib.load('models/xgb.pkl')
-        return True
+        return hmm_model, xgb_model
     except:
-        return False
+        return None, None
 
+@app.route('/predict')
 def predict():
-    if not load_models():
-        return {'predict': 'XIU', 'confidence': 0.5, 'prob_tai': 0.5}
+    hmm_model, xgb_model = load_models()
+    if hmm_model is None:
+        return jsonify({'predict': 'XIU', 'confidence': 0.5})
     try:
         conn = get_db()
         df = pd.read_sql('SELECT * FROM sessions ORDER BY id DESC LIMIT 35', conn)
         conn.close()
         if len(df) < 10:
-            return {'predict': 'XIU', 'confidence': 0.5, 'prob_tai': 0.5}
+            return jsonify({'predict': 'XIU', 'confidence': 0.5})
         df = df.sort_values('id').reset_index(drop=True)
         df['label'] = (df['result'] == 'TAI').astype(int)
         for lag in range(1, 6):
@@ -120,16 +114,12 @@ def predict():
         last = df.iloc[-1:][['point', 'rolling_mean', 'point_diff'] + [f'lag_{i}' for i in range(1,6)]].values
         prob_hmm = hmm_model.predict_proba(last)[0][1]
         prob_xgb = xgb_model.predict_proba(last)[0][1]
-        prob_final = 0.3*prob_hmm + 0.7*prob_xgb
+        prob_final = 0.4*prob_hmm + 0.6*prob_xgb
         pred = 'TAI' if prob_final >= 0.5 else 'XIU'
         conf = abs(prob_final - 0.5) * 2
-        return {'predict': pred, 'confidence': round(conf, 3), 'prob_tai': round(prob_final, 3)}
+        return jsonify({'predict': pred, 'confidence': round(conf, 3), 'prob_tai': round(prob_final, 3)})
     except Exception as e:
-        return {'predict': 'XIU', 'confidence': 0.5, 'prob_tai': 0.5}
-
-@app.route('/predict')
-def api_predict():
-    return jsonify(predict())
+        return jsonify({'predict': 'XIU', 'confidence': 0.5})
 
 def background_worker():
     init_db()
@@ -138,7 +128,7 @@ def background_worker():
         conn = get_db(); cur = conn.cursor()
         cur.execute('SELECT COUNT(*) FROM sessions')
         count = cur.fetchone()[0]; conn.close()
-        if count % RETRAIN_EVERY == 0 and count > 200:
+        if count % RETRAIN_EVERY == 0 and count > 100:
             train_models()
         time.sleep(POLL_INTERVAL)
 
