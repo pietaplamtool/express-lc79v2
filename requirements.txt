@@ -10,7 +10,6 @@ flask
 python-dotenv
 hmmlearn
 xgboost
-tensorflow
-keras-tuner
+lightgbm
 scipy
 joblib

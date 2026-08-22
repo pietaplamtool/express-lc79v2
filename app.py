@@ -4,12 +4,10 @@ from flask import Flask, jsonify
 from dotenv import load_dotenv
 from hmmlearn import hmm
 from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import StackingClassifier
 from sklearn.linear_model import LogisticRegression
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Conv1D, MaxPooling1D, Flatten, Bidirectional
-from tensorflow.keras.callbacks import EarlyStopping
 from scipy.stats import entropy
 import warnings
 warnings.filterwarnings('ignore')
@@ -140,30 +138,7 @@ def train_models():
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
         
-        # 1. LSTM với CNN (Deep Learning)
-        seq_len = 30
-        X_lstm, y_lstm = [], []
-        for i in range(seq_len, len(X_scaled)):
-            X_lstm.append(X_scaled[i-seq_len:i])
-            y_lstm.append(y[i])
-        X_lstm = np.array(X_lstm)
-        y_lstm = np.array(y_lstm)
-        
-        lstm_model = Sequential([
-            Conv1D(64, 3, activation='relu', input_shape=(seq_len, X_scaled.shape[1])),
-            MaxPooling1D(2),
-            Bidirectional(LSTM(64, return_sequences=True)),
-            Dropout(0.3),
-            Bidirectional(LSTM(32)),
-            Dense(16, activation='relu'),
-            Dense(1, activation='sigmoid')
-        ])
-        lstm_model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-        early_stop = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
-        lstm_model.fit(X_lstm, y_lstm, epochs=20, batch_size=64, validation_split=0.2, 
-                      callbacks=[early_stop], verbose=0)
-        
-        # 2. XGBoost (siêu mạnh)
+        # 1. XGBoost siêu mạnh
         xgb = XGBClassifier(
             n_estimators=300,
             max_depth=7,
@@ -177,6 +152,20 @@ def train_models():
         )
         xgb.fit(X_scaled, y)
         
+        # 2. LightGBM (nhanh và mạnh không kém XGBoost)
+        lgbm = LGBMClassifier(
+            n_estimators=200,
+            max_depth=7,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            random_state=42,
+            verbose=-1
+        )
+        lgbm.fit(X_scaled, y)
+        
         # 3. HMM (chuỗi Markov bậc 3)
         hmm_model = hmm.GaussianHMM(n_components=3, covariance_type='full', n_iter=100)
         hmm_model.fit(X_scaled)
@@ -185,20 +174,22 @@ def train_models():
         stacking_model = StackingClassifier(
             estimators=[
                 ('xgb', xgb),
-                ('hmm', hmm_model)  # HMM không có predict_proba, nhưng tạm dùng để demo
+                ('lgbm', lgbm)
             ],
             final_estimator=LogisticRegression(),
             cv=5
         )
+        stacking_model.fit(X_scaled, y)
+        
         # Lưu toàn bộ
         os.makedirs('models', exist_ok=True)
         joblib.dump(hmm_model, 'models/hmm.pkl')
         joblib.dump(xgb, 'models/xgb.pkl')
+        joblib.dump(lgbm, 'models/lgbm.pkl')
         joblib.dump(scaler, 'models/scaler.pkl')
         joblib.dump(feature_cols, 'models/feature_cols.pkl')
-        lstm_model.save('models/lstm.keras')
         joblib.dump(stacking_model, 'models/stacking.pkl')
-        print('[+] Super AI models trained successfully!')
+        print('[+] SUPER AI (XGBoost + LightGBM + HMM + Stacking) trained successfully!')
     except Exception as e:
         print(f'[-] Train error: {e}')
 
@@ -206,11 +197,11 @@ def load_models():
     try:
         hmm_model = joblib.load('models/hmm.pkl')
         xgb_model = joblib.load('models/xgb.pkl')
-        lstm_model = load_model('models/lstm.keras')
+        lgbm_model = joblib.load('models/lgbm.pkl')
         scaler = joblib.load('models/scaler.pkl')
         feature_cols = joblib.load('models/feature_cols.pkl')
         stacking_model = joblib.load('models/stacking.pkl')
-        return hmm_model, xgb_model, lstm_model, scaler, feature_cols, stacking_model
+        return hmm_model, xgb_model, lgbm_model, scaler, feature_cols, stacking_model
     except:
         return None, None, None, None, None, None
 
@@ -219,7 +210,7 @@ def predict():
     models = load_models()
     if models[0] is None:
         return jsonify({'predict': 'XIU', 'confidence': 0.5})
-    hmm_model, xgb_model, lstm_model, scaler, feature_cols, stacking_model = models
+    hmm_model, xgb_model, lgbm_model, scaler, feature_cols, stacking_model = models
     try:
         conn = get_db()
         df_raw = pd.read_sql('SELECT * FROM sessions ORDER BY id DESC LIMIT 100', conn)
@@ -233,20 +224,17 @@ def predict():
         # XGBoost
         prob_xgb = xgb_model.predict_proba(last_scaled)[0][1]
         
+        # LightGBM
+        prob_lgbm = lgbm_model.predict_proba(last_scaled)[0][1]
+        
         # HMM
         prob_hmm = hmm_model.predict_proba(last_scaled)[0][1]
         
-        # LSTM (cần sequence 30)
-        if len(df) >= 30:
-            seq = df.iloc[-30:][feature_cols].values
-            seq_scaled = scaler.transform(seq)
-            seq_reshaped = seq_scaled.reshape(1, 30, -1)
-            prob_lstm = lstm_model.predict(seq_reshaped, verbose=0)[0][0]
-        else:
-            prob_lstm = 0.5
+        # Stacking
+        prob_stack = stacking_model.predict_proba(last_scaled)[0][1]
         
         # Ensemble (weighted)
-        prob_final = 0.25*prob_hmm + 0.35*prob_xgb + 0.40*prob_lstm
+        prob_final = 0.20*prob_hmm + 0.30*prob_xgb + 0.25*prob_lgbm + 0.25*prob_stack
         pred = 'TAI' if prob_final >= 0.5 else 'XIU'
         conf = abs(prob_final - 0.5) * 2
         return jsonify({'predict': pred, 'confidence': round(conf, 3), 'prob_tai': round(prob_final, 3)})
@@ -293,19 +281,19 @@ def accuracy():
         models = load_models()
         if models[0] is None:
             return jsonify({'error': 'Model not ready'})
-        hmm_model, xgb_model, lstm_model, scaler, feature_cols, _ = models
+        hmm_model, xgb_model, lgbm_model, scaler, feature_cols, stacking_model = models
         
         correct, total, correct_high, high_count = 0, 0, 0, 0
-        for i in range(30, len(df)-1):
-            X = df.iloc[i-30:i][feature_cols].values
+        for i in range(10, len(df)-1):
+            X = df.iloc[i:i+1][feature_cols].values
             X_scaled = scaler.transform(X)
-            X_seq = X_scaled.reshape(1, 30, -1)
             actual = df.iloc[i+1]['label']
             
-            prob_hmm = hmm_model.predict_proba(X_scaled[-1:])[0][1]
-            prob_xgb = xgb_model.predict_proba(X_scaled[-1:])[0][1]
-            prob_lstm = lstm_model.predict(X_seq, verbose=0)[0][0]
-            prob_final = 0.25*prob_hmm + 0.35*prob_xgb + 0.40*prob_lstm
+            prob_hmm = hmm_model.predict_proba(X_scaled)[0][1]
+            prob_xgb = xgb_model.predict_proba(X_scaled)[0][1]
+            prob_lgbm = lgbm_model.predict_proba(X_scaled)[0][1]
+            prob_stack = stacking_model.predict_proba(X_scaled)[0][1]
+            prob_final = 0.20*prob_hmm + 0.30*prob_xgb + 0.25*prob_lgbm + 0.25*prob_stack
             confidence = abs(prob_final - 0.5) * 2
             pred = 1 if prob_final >= 0.5 else 0
             
