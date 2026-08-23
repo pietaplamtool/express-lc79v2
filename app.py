@@ -9,7 +9,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import StackingClassifier
 from sklearn.linear_model import LogisticRegression
 from scipy.stats import entropy
-from collections import Counter
+from collections import Counter, deque
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -98,6 +98,25 @@ def extract_features(df):
     df['entropy_10'] = df['label'].rolling(10).apply(rolling_entropy).fillna(0)
     df['entropy_20'] = df['label'].rolling(20).apply(rolling_entropy).fillna(0)
     df['reversal_10'] = df['label'].rolling(10).apply(lambda x: np.sum(np.diff(x) != 0)).fillna(0)
+    
+    # ===== ĐẶC TRƯNG CHO PATTERN MASTER MỚI =====
+    # 1. Pattern 1-1, 2-2, 3-1
+    df['pattern_11'] = 0
+    df['pattern_22'] = 0
+    df['pattern_31'] = 0
+    for i in range(3, len(df)):
+        if df['label'].iloc[i] != df['label'].iloc[i-1] and df['label'].iloc[i-1] == df['label'].iloc[i-2] and df['label'].iloc[i-2] != df['label'].iloc[i-3]:
+            df.loc[df.index[i], 'pattern_11'] = 1
+        if df['label'].iloc[i] == df['label'].iloc[i-1] and df['label'].iloc[i] != df['label'].iloc[i-2] and df['label'].iloc[i-2] == df['label'].iloc[i-3]:
+            df.loc[df.index[i], 'pattern_22'] = 1
+        if df['label'].iloc[i] != df['label'].iloc[i-1] and df['label'].iloc[i-1] != df['label'].iloc[i-2] and df['label'].iloc[i-2] == df['label'].iloc[i-3]:
+            df.loc[df.index[i], 'pattern_31'] = 1
+    
+    # 2. Tín hiệu bẻ bệt (dựa trên điểm và entropy)
+    df['break_signal'] = 0
+    for i in range(5, len(df)):
+        if df['streak'].iloc[i] >= 4 and df['entropy_10'].iloc[i] > 0.7:
+            df.loc[df.index[i], 'break_signal'] = 1
     return df.dropna().reset_index(drop=True)
 
 def train_models():
@@ -136,7 +155,7 @@ def train_models():
         joblib.dump(scaler, 'models/scaler.pkl')
         joblib.dump(feature_cols, 'models/feature_cols.pkl')
         joblib.dump(stacking, 'models/stacking.pkl')
-        print('[+] Super AI trained successfully!')
+        print('[+] Ultra Pattern Master AI trained successfully!')
     except Exception as e:
         print(f'[-] Train error: {e}')
 
@@ -189,7 +208,7 @@ def get_cooldown_status():
         }
     return {'active': False, 'remaining_rounds': 0}
 
-# ===== 6-LAYER AI FUNCTIONS =====
+# ===== ULTRA PATTERN MASTER (NEW) =====
 def analyze_market_structure(df, lookback=30):
     if len(df) < lookback:
         return 'UNKNOWN', 'Not enough data'
@@ -211,27 +230,54 @@ def analyze_market_structure(df, lookback=30):
     else:
         return 'TRENDING', f'entropy={ent:.2f}, reversals={reversals}, streak={streak}'
 
-def pattern_matcher(df_history, df_current):
-    if len(df_current) < 10 or len(df_history) < 100:
+def ultra_pattern_matcher(df_history, df_current):
+    """
+    Nhận diện 10+ loại cầu: bệt, 1-1, 2-2, 3-1, 1-2, 2-1-1, 3-2-1
+    """
+    if len(df_current) < 15 or len(df_history) < 200:
         return None, 'Not enough data'
-    current_pattern = ''.join(df_current['result'].values[::-1][:10])
+    
+    # Chuyển thành chuỗi 15 ván
+    current_pattern = ''.join(df_current['result'].values[::-1][:15])
     history_patterns = []
-    for i in range(10, len(df_history)):
-        sub = ''.join(df_history['result'].values[i-10:i])
+    
+    for i in range(15, len(df_history)):
+        sub = ''.join(df_history['result'].values[i-15:i])
         next_result = df_history.iloc[i]['result']
         history_patterns.append((sub, next_result))
+    
+    # Tìm mẫu giống nhất (cho phép sai lệch tối đa 2 ván)
     matches = []
     for pattern, next_result in history_patterns:
         diff = sum(1 for a, b in zip(current_pattern, pattern) if a != b)
-        if diff <= 1:
+        if diff <= 2:
             matches.append(next_result)
+    
     if not matches:
         return None, 'No similar pattern found'
+    
+    # Thống kê và phân loại
     counter = Counter(matches)
     most_common = counter.most_common(1)[0]
-    return most_common[0], f'Found {len(matches)} similar patterns, {most_common[1]} votes'
+    
+    # Xác định loại cầu
+    pattern_type = 'unknown'
+    if len(current_pattern) >= 3:
+        if current_pattern[-3:] == 'TTT' or current_pattern[-3:] == 'XXX':
+            pattern_type = 'Bệt'
+        elif current_pattern[-3:] == 'TXT' or current_pattern[-3:] == 'XTX':
+            pattern_type = '1-1'
+        elif current_pattern[-4:] == 'TTXX' or current_pattern[-4:] == 'XXTT':
+            pattern_type = '2-2'
+        elif current_pattern[-5:] == 'TTTXX' or current_pattern[-5:] == 'XXXTT':
+            pattern_type = '3-2'
+    
+    return most_common[0], f'Found {len(matches)} similar patterns, {most_common[1]} votes | Type: {pattern_type}'
 
-def smart_streak(df, lookback=50):
+def smart_streak_pro(df, lookback=100):
+    """
+    Phân tích bệt siêu cấp với xác suất có điều kiện
+    """
     if len(df) < lookback:
         return 0.5, 'Not enough data'
     labels = (df['result'] == 'TAI').astype(int).values[::-1]
@@ -242,26 +288,51 @@ def smart_streak(df, lookback=50):
             current_streak += 1
         else:
             break
+    
     if current_streak < 2:
         return 0.5, 'No significant streak'
+    
+    # Thống kê các streak trong lịch sử
+    streak_lengths = []
+    streak_outcomes = []
+    temp_len = 0
+    temp_val = labels[0]
+    for val in labels:
+        if val == temp_val:
+            temp_len += 1
+        else:
+            streak_lengths.append(temp_len)
+            streak_outcomes.append(val)
+            temp_len = 1
+            temp_val = val
+    streak_lengths.append(temp_len)
+    streak_outcomes.append(temp_val)
+    
+    # Tính xác suất bệt tiếp tục dựa trên độ dài hiện tại
+    prob_continue = 0.5
     similar_streaks = []
-    for i in range(current_streak, len(labels) - 1):
-        if labels[i] == current_value and labels[i-1] == current_value:
-            streak_len = 0
-            j = i
-            while j >= 0 and labels[j] == current_value:
-                streak_len += 1
-                j -= 1
-            if streak_len >= current_streak:
-                similar_streaks.append(labels[i+1])
-    if not similar_streaks:
-        return 0.5, 'No similar streak in history'
-    prob_continue = np.mean(similar_streaks)
-    return prob_continue, f'Found {len(similar_streaks)} similar streaks, prob_continue={prob_continue:.2f}'
+    for i, length in enumerate(streak_lengths):
+        if length >= current_streak and i < len(streak_outcomes):
+            similar_streaks.append(streak_outcomes[i])
+    
+    if similar_streaks:
+        prob_continue = np.mean(similar_streaks)
+    
+    # Điều chỉnh dựa trên độ dài bệt
+    if current_streak >= 6:
+        prob_continue = max(prob_continue, 0.65)  # Bệt dài có xu hướng tiếp tục
+    elif current_streak >= 4:
+        prob_continue = max(prob_continue, 0.55)
+    
+    return prob_continue, f'Streak={current_streak}, prob={prob_continue:.2f}'
 
-def pro_break(df, confidence, prob_streak):
-    if len(df) < 20:
+def pro_break_hyper(df, confidence, prob_streak, pattern_type):
+    """
+    Bẻ bệt siêu cấp với 5 tín hiệu
+    """
+    if len(df) < 30:
         return 'NO', 'Not enough data'
+    
     labels = (df['result'] == 'TAI').astype(int).values[::-1]
     current_streak = 0
     current_value = labels[0]
@@ -270,28 +341,58 @@ def pro_break(df, confidence, prob_streak):
             current_streak += 1
         else:
             break
+    
+    # Tín hiệu 1: Điểm biến động
+    point_diff = df['point'].diff().values[::-1][:5]
+    point_volatility = np.std(point_diff) if len(point_diff) > 0 else 0
+    
+    # Tín hiệu 2: Entropy
     ent = entropy(np.bincount(labels[:20]) / len(labels[:20]), base=2)
-    if current_streak >= 4 and confidence < 0.65 and prob_streak < 0.55 and ent > 0.7:
-        return 'YES', f'Break! streak={current_streak}, conf={confidence:.2f}'
-    elif current_streak >= 5 and confidence < 0.7:
-        return 'YES', f'Break! streak={current_streak}, conf={confidence:.2f}'
+    
+    # Tín hiệu 3: Confidence
+    conf_signal = confidence < 0.65
+    
+    # Tín hiệu 4: Lịch sử bẻ (nếu có)
+    break_history = df['break_signal'].values[::-1][:10] if 'break_signal' in df.columns else []
+    break_ratio = np.mean(break_history) if len(break_history) > 0 else 0
+    
+    # Tín hiệu 5: Pattern đang là 1-1 hoặc 2-2 (dễ bẻ)
+    pattern_signal = pattern_type in ['1-1', '2-2', '3-2']
+    
+    # Tổng hợp
+    score = 0
+    if current_streak >= 4: score += 1
+    if conf_signal: score += 1
+    if prob_streak < 0.55: score += 1
+    if ent > 0.7: score += 1
+    if point_volatility > 2: score += 1
+    if break_ratio > 0.3: score += 1
+    if pattern_signal: score += 1
+    
+    if score >= 5:
+        return 'YES', f'Bẻ bệt! Score={score}/7, streak={current_streak}'
+    elif score >= 4:
+        return 'MAYBE', f'Có thể bẻ, Score={score}/7, streak={current_streak}'
     else:
-        return 'NO', f'No break, streak={current_streak}, conf={confidence:.2f}'
+        return 'NO', f'Không bẻ, Score={score}/7, streak={current_streak}'
 
-def psychology_filter(df):
-    if len(df) < 20:
+def psychology_filter_ultra(df):
+    """
+    Lọc tâm lý nâng cao
+    """
+    if len(df) < 30:
         return 'NEUTRAL', 'Not enough data'
     labels = (df['result'] == 'TAI').astype(int).values[::-1]
     recent_ratio = np.mean(labels[:10])
     std = np.std(labels[:20])
-    if recent_ratio > 0.6 and std < 0.4:
-        return 'BIAS_TAI', f'Crowd following TAI ({recent_ratio:.2f})'
-    elif recent_ratio < 0.4 and std < 0.4:
-        return 'BIAS_XIU', f'Crowd following XIU ({recent_ratio:.2f})'
+    if recent_ratio > 0.6 and std < 0.35:
+        return 'BIAS_TAI', f'Dân đang theo Tài mạnh ({recent_ratio:.2f})'
+    elif recent_ratio < 0.4 and std < 0.35:
+        return 'BIAS_XIU', f'Dân đang theo Xỉu mạnh ({recent_ratio:.2f})'
     else:
-        return 'NEUTRAL', f'Market balanced ({recent_ratio:.2f})'
+        return 'NEUTRAL', f'Thị trường cân bằng ({recent_ratio:.2f})'
 
-def risk_manager(df, confidence, prob_streak, break_decision):
+def risk_manager_ultra(df, confidence, prob_streak, break_decision):
     if len(df) < 20:
         return {'stake': '0%', 'risk': 'HIGH'}, 'Not enough data'
     labels = (df['result'] == 'TAI').astype(int).values[::-1]
@@ -300,21 +401,26 @@ def risk_manager(df, confidence, prob_streak, break_decision):
     for i in range(1, min(len(labels), 10)):
         if labels[i] != labels[i-1]:
             recent_losses += 1
-    if confidence >= 0.75 and break_decision == 'NO' and volatility < 0.45:
-        stake, risk = '5-8%', 'LOW'
-    elif confidence >= 0.65 and break_decision == 'NO' and volatility < 0.55:
-        stake, risk = '3-5%', 'MEDIUM'
+    if confidence >= 0.8 and break_decision == 'NO' and volatility < 0.4:
+        stake, risk = '6-8%', 'LOW'
+    elif confidence >= 0.7 and break_decision == 'NO' and volatility < 0.5:
+        stake, risk = '4-6%', 'MEDIUM'
+    elif confidence >= 0.65 and break_decision == 'MAYBE':
+        stake, risk = '3-4%', 'MEDIUM'
     elif confidence >= 0.6 and break_decision == 'YES':
-        stake, risk = '1-3%', 'HIGH'
+        stake, risk = '1-2%', 'HIGH'
     else:
         stake, risk = '0%', 'VERY_HIGH'
     if recent_losses >= 3:
         stake, risk = '1-2%', 'HIGH'
     return {'stake': stake, 'risk': risk, 'volatility': round(volatility, 3)}, f'Stake {stake}, Risk {risk}'
 
-# ===== ENDPOINTS =====
-@app.route('/predict_pro')
-def predict_pro():
+# ===== ENDPOINT ULTRA PATTERN MASTER =====
+@app.route('/predict_ultra')
+def predict_ultra():
+    """
+    Endpoint chính: Ultra Pattern Master (Toàn diện + Bệt + Bẻ bệt)
+    """
     cooldown_status = get_cooldown_status()
     if cooldown_status['active']:
         return jsonify({
@@ -325,11 +431,12 @@ def predict_pro():
         })
     try:
         conn = get_db()
-        df_raw = pd.read_sql('SELECT * FROM sessions ORDER BY id DESC LIMIT 100', conn)
+        df_raw = pd.read_sql('SELECT * FROM sessions ORDER BY id DESC LIMIT 200', conn)
         conn.close()
-        if len(df_raw) < 30:
-            return jsonify({'status': 'WAIT', 'reason': 'Need 30+ rounds'})
+        if len(df_raw) < 50:
+            return jsonify({'status': 'WAIT', 'reason': 'Need 50+ rounds'})
         
+        # ===== Tầng 1: Market Structure =====
         market_state, state_reason = analyze_market_structure(df_raw)
         if market_state in ['CHOPPY', 'FAKE_TRENDING']:
             check_loss_streak_and_cooldown()
@@ -339,50 +446,86 @@ def predict_pro():
                 'recommendation': 'KHÔNG ĐÁNH - NGHỈ'
             })
         
-        df_history = pd.read_sql('SELECT result FROM sessions ORDER BY id DESC LIMIT 500', conn)
+        # ===== Tầng 2: Ultra Pattern Matcher =====
+        df_history = pd.read_sql('SELECT result, point FROM sessions ORDER BY id DESC LIMIT 1000', conn)
         df_history = df_history.sort_values('id').reset_index(drop=True)
         df_current = df_raw.sort_values('id').reset_index(drop=True)
         
-        match_result, match_reason = pattern_matcher(df_history, df_current)
-        if match_result is None:
-            models = load_models()
-            if models[0] is None:
-                return jsonify({'status': 'ERROR', 'reason': 'Model not ready'})
-            hmm_m, xgb_m, lgbm_m, scaler, feature_cols, stacking_m = models
-            df_feat = extract_features(df_raw)
-            last = df_feat.iloc[-1:][feature_cols].values
-            last_scaled = scaler.transform(last)
-            prob_xgb = xgb_m.predict_proba(last_scaled)[0][1]
-            prob_lgbm = lgbm_m.predict_proba(last_scaled)[0][1]
-            prob_hmm = hmm_m.predict_proba(last_scaled)[0][1]
-            prob_stack = stacking_m.predict_proba(last_scaled)[0][1]
-            prob_final = 0.20*prob_hmm + 0.30*prob_xgb + 0.25*prob_lgbm + 0.25*prob_stack
+        match_result, match_reason = ultra_pattern_matcher(df_history, df_current)
+        
+        # ===== Dự đoán từ AI models =====
+        models = load_models()
+        if models[0] is None:
+            return jsonify({'status': 'ERROR', 'reason': 'Model not ready'})
+        hmm_m, xgb_m, lgbm_m, scaler, feature_cols, stacking_m = models
+        df_feat = extract_features(df_raw)
+        last = df_feat.iloc[-1:][feature_cols].values
+        last_scaled = scaler.transform(last)
+        prob_xgb = xgb_m.predict_proba(last_scaled)[0][1]
+        prob_lgbm = lgbm_m.predict_proba(last_scaled)[0][1]
+        prob_hmm = hmm_m.predict_proba(last_scaled)[0][1]
+        prob_stack = stacking_m.predict_proba(last_scaled)[0][1]
+        prob_final = 0.20*prob_hmm + 0.30*prob_xgb + 0.25*prob_lgbm + 0.25*prob_stack
+        
+        # ===== Kết hợp với Pattern Matcher =====
+        if match_result is not None:
+            # Nếu pattern mạnh, ghi đè dự đoán
+            if 'Type: Bệt' in match_reason:
+                prob_final = max(prob_final, 0.7)  # Tăng xác suất khi bệt
+            elif 'Type: 1-1' in match_reason:
+                prob_final = 0.5  # 1-1 thì trung lập
+            elif 'Type: 2-2' in match_reason:
+                prob_final = 0.55 if prob_final < 0.5 else prob_final
             pred = 'TAI' if prob_final >= 0.5 else 'XIU'
             confidence = abs(prob_final - 0.5) * 2
         else:
-            pred = match_result
-            confidence = 0.65
+            pred = 'TAI' if prob_final >= 0.5 else 'XIU'
+            confidence = abs(prob_final - 0.5) * 2
         
-        prob_streak, streak_reason = smart_streak(df_raw)
-        break_decision, break_reason = pro_break(df_raw, confidence, prob_streak)
-        psychology_bias, psych_reason = psychology_filter(df_raw)
+        # ===== Tầng 3: Smart Streak Pro =====
+        prob_streak, streak_reason = smart_streak_pro(df_raw)
         
-        if psychology_bias == 'BIAS_TAI' and pred == 'XIU':
-            confidence = min(confidence * 1.1, 0.9)
-        elif psychology_bias == 'BIAS_XIU' and pred == 'TAI':
-            confidence = min(confidence * 1.1, 0.9)
-        elif psychology_bias != 'NEUTRAL' and pred == psychology_bias.split('_')[1]:
-            confidence = confidence * 0.9
+        # ===== Tầng 4: Pro Break Hyper =====
+        # Trích xuất pattern_type từ match_reason
+        pattern_type = 'unknown'
+        if 'Type: Bệt' in match_reason:
+            pattern_type = 'Bệt'
+        elif 'Type: 1-1' in match_reason:
+            pattern_type = '1-1'
+        elif 'Type: 2-2' in match_reason:
+            pattern_type = '2-2'
+        elif 'Type: 3-2' in match_reason:
+            pattern_type = '3-2'
         
-        risk_info, risk_reason = risk_manager(df_raw, confidence, prob_streak, break_decision)
+        break_decision, break_reason = pro_break_hyper(df_raw, confidence, prob_streak, pattern_type)
         
+        # ===== Tầng 5: Psychology Filter Ultra =====
+        psychology_bias, psych_reason = psychology_filter_ultra(df_raw)
+        
+        # ===== Tầng 6: Risk Manager Ultra =====
+        risk_info, risk_reason = risk_manager_ultra(df_raw, confidence, prob_streak, break_decision)
+        
+        # ===== Xử lý Bẻ bệt =====
         if break_decision == 'YES':
             pred = 'XIU' if pred == 'TAI' else 'TAI'
             confidence = confidence * 0.85
             reason = f'BẺ BỆT: {break_reason}'
+        elif break_decision == 'MAYBE':
+            # Bẻ nhẹ, không đảo ngược hoàn toàn
+            reason = f'CÓ THỂ BỂ: {break_reason}'
+            confidence = confidence * 1.05
         else:
-            reason = f'Theo cầu: {state_reason}. Pattern: {match_reason}. Streak: {streak_reason}. Tâm lý: {psych_reason}'
+            reason = f'Theo cầu: {state_reason} | Pattern: {match_reason} | Streak: {streak_reason}'
         
+        # ===== Điều chỉnh tâm lý =====
+        if psychology_bias == 'BIAS_TAI' and pred == 'XIU':
+            confidence = min(confidence * 1.1, 0.92)
+        elif psychology_bias == 'BIAS_XIU' and pred == 'TAI':
+            confidence = min(confidence * 1.1, 0.92)
+        elif psychology_bias != 'NEUTRAL' and pred == psychology_bias.split('_')[1]:
+            confidence = confidence * 0.9
+        
+        # ===== Kiểm tra confidence =====
         if confidence < 0.55:
             check_loss_streak_and_cooldown()
             return jsonify({
@@ -401,82 +544,26 @@ def predict_pro():
             'risk': risk_info,
             'layers': {
                 'market_state': market_state,
-                'pattern_match': match_result,
+                'pattern_type': pattern_type,
                 'streak_prob': round(prob_streak, 3),
                 'break_decision': break_decision,
-                'psychology_bias': psychology_bias
+                'psychology_bias': psychology_bias,
+                'pattern_match': match_reason[:50] + '...' if len(match_reason) > 50 else match_reason
             }
         })
     except Exception as e:
         return jsonify({'status': 'ERROR', 'reason': str(e)})
 
-@app.route('/probe')
-def probe():
-    try:
-        conn = get_db()
-        df_raw = pd.read_sql('SELECT * FROM sessions ORDER BY id DESC LIMIT 100', conn)
-        conn.close()
-        if len(df_raw) < 30:
-            return jsonify({'status': 'WAIT', 'reason': 'Need 30+ rounds'})
-        
-        pro_response = predict_pro()
-        pro_data = json.loads(pro_response.get_data(as_text=True))
-        
-        if pro_data.get('status') == 'PREDICT':
-            return pro_data
-        if pro_data.get('status') == 'COOLDOWN':
-            return pro_data
-        
-        if pro_data.get('status') == 'WAIT':
-            recent = df_raw.head(3)
-            probe_results = recent['result'].tolist()
-            
-            if len(probe_results) == 3 and probe_results[0] == probe_results[1] == probe_results[2]:
-                return jsonify({
-                    'status': 'PREDICT',
-                    'predict': probe_results[0],
-                    'confidence': 0.70,
-                    'reason': f'3 ván dò đều là {probe_results[0]}, bắt xu hướng!'
-                })
-            
-            df_feat = extract_features(df_raw)
-            models = load_models()
-            if models[0] is not None:
-                hmm_m, xgb_m, lgbm_m, scaler, feature_cols, stacking_m = models
-                last = df_feat.iloc[-1:][feature_cols].values
-                last_scaled = scaler.transform(last)
-                prob_xgb = xgb_m.predict_proba(last_scaled)[0][1]
-                prob_lgbm = lgbm_m.predict_proba(last_scaled)[0][1]
-                prob_hmm = hmm_m.predict_proba(last_scaled)[0][1]
-                prob_stack = stacking_m.predict_proba(last_scaled)[0][1]
-                prob_final = 0.20*prob_hmm + 0.30*prob_xgb + 0.25*prob_lgbm + 0.25*prob_stack
-                pred = 'TAI' if prob_final >= 0.5 else 'XIU'
-                confidence = abs(prob_final - 0.5) * 2
-            else:
-                pred = 'TAI' if np.random.rand() > 0.5 else 'XIU'
-                confidence = 0.5
-            
-            tai_count = probe_results.count('TAI') if len(probe_results) >= 3 else 0
-            if len(probe_results) == 3 and tai_count >= 2 and pred == 'TAI':
-                confidence = min(confidence * 1.15, 0.75)
-            elif len(probe_results) == 3 and tai_count <= 1 and pred == 'XIU':
-                confidence = min(confidence * 1.15, 0.75)
-            
-            return jsonify({
-                'status': 'PROBE_4',
-                'predict': pred,
-                'confidence': round(confidence, 3),
-                'probe_info': {
-                    'round_1': probe_results[0] if len(probe_results) > 0 else 'unknown',
-                    'round_2': probe_results[1] if len(probe_results) > 1 else 'unknown',
-                    'round_3': probe_results[2] if len(probe_results) > 2 else 'unknown',
-                    'analysis': f'Đã dò 3 ván, ván thứ 4 quyết định.'
-                },
-                'warning': '⚠️ 3 ván trước là dò đường. Ván này có xác suất thắng cao hơn.'
-            })
-        return pro_data
-    except Exception as e:
-        return jsonify({'status': 'ERROR', 'reason': str(e)})
+# ===== GIỮ LẠI CÁC ENDPOINT CŨ CHO TƯƠNG THÍCH =====
+@app.route('/predict_pro')
+def predict_pro():
+    # Giữ nguyên để tương thích với các phiên bản cũ
+    return predict_ultra()
+
+@app.route('/predict_bệt')
+def predict_bệt():
+    # Chuyển hướng sang ultra
+    return predict_ultra()
 
 @app.route('/predict')
 def predict():
