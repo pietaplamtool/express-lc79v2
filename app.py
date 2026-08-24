@@ -65,7 +65,7 @@ def fetch_and_save():
             ''', (d['id'], d['resultTruyenThong'], d['dices'][0], d['dices'][1], d['dices'][2], d['point']))
         conn.commit(); conn.close()
         r.set('last_id', latest_id)
-        print(f'[+] Saved {len(new_records)} new rounds. Total: {r.get("total_count") or 0}')
+        print(f'[+] Saved {len(new_records)} new rounds.')
     except Exception as e:
         print(f'[-] Fetch error: {e}')
 
@@ -191,7 +191,8 @@ def history():
             history_data.append({
                 'id': row['id'],
                 'result': row['result'],
-                'point': row['point']
+                'point': row['point'],
+                'dices': [row['dice1'], row['dice2'], row['dice3']]
             })
         return jsonify({
             'recent': history_data,
@@ -199,6 +200,129 @@ def history():
         })
     except Exception as e:
         return jsonify({'error': str(e)})
+
+@app.route('/history50')
+def history50():
+    """
+    Xem 50 ván gần nhất + tỉ lệ thắng thực tế (dựa trên kết quả game)
+    """
+    try:
+        conn = get_db()
+        df = pd.read_sql('''
+            SELECT id, result, point, dice1, dice2, dice3, created_at 
+            FROM sessions 
+            ORDER BY id DESC 
+            LIMIT 50
+        ''', conn)
+        conn.close()
+
+        if len(df) < 10:
+            return jsonify({'error': 'Not enough data (need at least 10 rounds)'})
+
+        tai_count = (df['result'] == 'TAI').sum()
+        xiu_count = (df['result'] == 'XIU').sum()
+        total = len(df)
+
+        recent = df.to_dict(orient='records')[::-1]
+
+        history_data = []
+        for row in recent:
+            history_data.append({
+                'id': row['id'],
+                'result': row['result'],
+                'point': row['point'],
+                'dices': [row['dice1'], row['dice2'], row['dice3']],
+                'time': row['created_at'].strftime('%d-%m-%Y %H:%M:%S') if row['created_at'] else None
+            })
+
+        win_rate = round(max(tai_count, xiu_count) / total * 100, 1)
+
+        return jsonify({
+            'total_rounds': total,
+            'tai': int(tai_count),
+            'xiu': int(xiu_count),
+            'win_rate': win_rate,
+            'history': history_data,
+            'status': 'ready'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/streak_20')
+def streak_20():
+    try:
+        conn = get_db()
+        df = pd.read_sql('SELECT result FROM sessions ORDER BY id DESC LIMIT 20', conn)
+        conn.close()
+        if len(df) < 2:
+            return jsonify({'error': 'Not enough data'})
+        
+        recent = df['result'].values[::-1]
+        max_streak_tai = 0
+        max_streak_xiu = 0
+        current_tai = 0
+        current_xiu = 0
+        
+        for res in recent:
+            if res == 'TAI':
+                current_tai += 1
+                current_xiu = 0
+                max_streak_tai = max(max_streak_tai, current_tai)
+            else:
+                current_xiu += 1
+                current_tai = 0
+                max_streak_xiu = max(max_streak_xiu, current_xiu)
+        
+        return jsonify({
+            'max_win_streak_20': max_streak_tai,
+            'max_loss_streak_20': max_streak_xiu,
+            'total_tai': list(recent).count('TAI'),
+            'total_xiu': list(recent).count('XIU'),
+            'status': 'ready'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/accuracy')
+def accuracy():
+    try:
+        conn = get_db()
+        df = pd.read_sql('SELECT result FROM sessions ORDER BY id DESC LIMIT 200', conn)
+        conn.close()
+        if len(df) < 10:
+            return jsonify({'error': 'Need at least 10 rounds'})
+        
+        recent = df['result'].values[::-1]
+        tai_count = sum(1 for r in recent if r == 'TAI')
+        xiu_count = len(recent) - tai_count
+        
+        last_10 = recent[:10]
+        tai_last_10 = sum(1 for r in last_10 if r == 'TAI')
+        xiu_last_10 = 10 - tai_last_10
+        
+        if tai_last_10 > xiu_last_10:
+            trend = 'TAI'
+            ratio = tai_last_10 / 10
+        else:
+            trend = 'XIU'
+            ratio = xiu_last_10 / 10
+        
+        return jsonify({
+            'total_samples': len(recent),
+            'tai': tai_count,
+            'xiu': xiu_count,
+            'current_trend': trend,
+            'trend_strength': round(ratio * 100, 1),
+            'estimated_win_rate': round(max(tai_count, xiu_count) / len(recent) * 100, 1),
+            'status': 'ready',
+            'note': 'Đây là tỉ lệ dựa trên lịch sử thực tế, không phải tỉ lệ dự đoán của AI.'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/retrain')
+def force_retrain():
+    return jsonify({'status': 'AI đang tự học liên tục, không cần retrain thủ công.'})
 
 def background_worker():
     init_db()
