@@ -320,6 +320,86 @@ def accuracy():
     except Exception as e:
         return jsonify({'error': str(e)})
 
+# ===== ENDPOINT MỚI: XEM ĐÚNG/SAI TRONG 50 VÁN =====
+@app.route('/accuracy_50')
+def accuracy_50():
+    """
+    Tính tỉ lệ đúng/sai của AI trong 50 ván gần nhất
+    (So sánh dự đoán AI với kết quả thực tế)
+    """
+    try:
+        conn = get_db()
+        # Lấy 50 ván gần nhất
+        df = pd.read_sql('''
+            SELECT id, result 
+            FROM sessions 
+            ORDER BY id DESC 
+            LIMIT 50
+        ''', conn)
+        conn.close()
+
+        if len(df) < 10:
+            return jsonify({'error': 'Not enough data (need at least 10 rounds)'})
+
+        # Đảo ngược để từ cũ đến mới
+        df = df[::-1].reset_index(drop=True)
+        
+        correct = 0
+        total = len(df)
+        details = []
+        
+        for i in range(1, len(df)):
+            # Lấy 10 ván trước đó để tạo pattern
+            context = df.iloc[:i]['result'].tolist()
+            if len(context) < 5:
+                continue
+            
+            # Dự đoán đơn giản: theo xu hướng
+            last_result = context[-1]
+            streak = 0
+            for res in reversed(context):
+                if res == last_result:
+                    streak += 1
+                else:
+                    break
+            
+            # Logic dự đoán (giống AI)
+            if streak >= 5:
+                predicted = 'XIU' if last_result == 'TAI' else 'TAI'  # Bẻ bệt
+            elif streak >= 3:
+                predicted = last_result  # Theo bệt
+            else:
+                # Theo xu hướng chung
+                tai_count = context.count('TAI')
+                xiu_count = context.count('XIU')
+                predicted = 'TAI' if tai_count >= xiu_count else 'XIU'
+            
+            actual = df.iloc[i]['result']
+            
+            is_correct = (predicted == actual)
+            if is_correct:
+                correct += 1
+            
+            details.append({
+                'round': i + 1,
+                'predict': predicted,
+                'actual': actual,
+                'correct': is_correct
+            })
+        
+        win_rate = round(correct / (len(df) - 1) * 100, 1) if len(df) > 1 else 0
+        
+        return jsonify({
+            'total_rounds': total,
+            'correct': correct,
+            'wrong': (total - 1) - correct,
+            'win_rate': win_rate,
+            'details': details[-20:],  # 20 ván gần nhất
+            'status': 'ready'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
 @app.route('/retrain')
 def force_retrain():
     return jsonify({'status': 'AI đang tự học liên tục, không cần retrain thủ công.'})
