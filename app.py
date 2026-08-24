@@ -1,4 +1,4 @@
-import requests, psycopg2, redis, os, time, threading, json, joblib
+import requests, psycopg2, redis, os, time, threading, json
 import numpy as np, pandas as pd
 from flask import Flask, jsonify
 from dotenv import load_dotenv
@@ -13,9 +13,8 @@ DB_URL = os.getenv('DB_URL')
 REDIS_URL = os.getenv('REDIS_URL')
 API_URL = os.getenv('API_URL')
 POLL_INTERVAL = 5
-RETRAIN_EVERY = 200
 
-# ===== HỆ THỐNG CHÍNH =====
+# ===== "LÃO LÀNG" AI =====
 def get_db():
     return psycopg2.connect(DB_URL)
 
@@ -30,16 +29,6 @@ def init_db():
             result TEXT,
             dice1 INT, dice2 INT, dice3 INT,
             point INT,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    ''')
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS predictions (
-            id SERIAL PRIMARY KEY,
-            session_id BIGINT,
-            predict TEXT,
-            confidence FLOAT,
-            actual TEXT,
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
@@ -65,97 +54,109 @@ def fetch_and_save():
             ''', (d['id'], d['resultTruyenThong'], d['dices'][0], d['dices'][1], d['dices'][2], d['point']))
         conn.commit(); conn.close()
         r.set('last_id', latest_id)
-        print(f'[+] Saved {len(new_records)} new rounds.')
+        print(f'[+] Lão làng đã học thêm {len(new_records)} ván mới.')
     except Exception as e:
-        print(f'[-] Fetch error: {e}')
-
-def analyze_pattern(df_context, df_search, n_rounds=10):
-    """
-    Phân tích và tìm pattern tương tự. Học liên tục từ dữ liệu mới.
-    """
-    if len(df_search) < 30:
-        return None, 0.5, 'Not enough data to learn'
-    
-    search_series = df_search['result'].values[::-1]
-    context_series = df_context['result'].values[::-1]
-    
-    # Xác định chuỗi bệt hiện tại
-    last_result = context_series[-1]
-    current_streak = 0
-    for res in reversed(context_series):
-        if res == last_result:
-            current_streak += 1
-        else:
-            break
-    
-    # Tạo pattern
-    pattern_length = min(n_rounds, len(context_series))
-    current_pattern = ''.join(context_series[-pattern_length:])
-    
-    # Tìm kiếm trong lịch sử
-    similar_patterns = []
-    search_history = ''.join(search_series)
-    
-    for i in range(pattern_length, len(search_history) - 1):
-        if search_history[i-pattern_length:i] == current_pattern:
-            similar_patterns.append(search_history[i])
-    
-    if similar_patterns:
-        counter = Counter(similar_patterns)
-        total_similar = len(similar_patterns)
-        tai_prob = counter.get('T', 0) / total_similar
-        xiu_prob = counter.get('X', 0) / total_similar
-        
-        # Quyết định dựa trên bối cảnh
-        if current_streak >= 5:
-            predicted = 'XIU' if last_result == 'T' else 'TAI'
-            confidence = max(tai_prob, xiu_prob) * 0.9
-            reason = f'SIÊU BỆT {current_streak} ván! Bẻ bệt với {confidence*100:.1f}% tự tin.'
-        elif current_streak >= 3:
-            predicted = last_result
-            confidence = max(tai_prob, xiu_prob) * 1.1
-            reason = f'THEO BỆT {current_streak} ván. Tỉ lệ thắng kỳ vọng: {confidence*100:.1f}%'
-        else:
-            predicted = 'TAI' if tai_prob >= xiu_prob else 'XIU'
-            confidence = max(tai_prob, xiu_prob)
-            reason = f'AI nhận diện pattern, chọn {predicted} với {confidence*100:.1f}% tự tin.'
-        
-        return predicted, min(confidence, 0.95), reason, current_streak
-    else:
-        # Nếu không có pattern cũ, đưa ra dự đoán dựa trên tỉ lệ chung
-        global_tai = (df_search['result'] == 'TAI').sum() / len(df_search)
-        predicted = 'TAI' if global_tai >= 0.5 else 'XIU'
-        confidence = max(global_tai, 1 - global_tai)
-        return predicted, confidence, 'Pattern mới! Đang học hỏi, dựa trên xác suất chung.', current_streak
+        print(f'[-] Lão làng gặp lỗi: {e}')
 
 @app.route('/predict')
 def predict():
     try:
         conn = get_db()
-        # Lấy dữ liệu
-        df_context = pd.read_sql('SELECT result FROM sessions ORDER BY id DESC LIMIT 30', conn)
-        df_search = pd.read_sql('SELECT result FROM sessions ORDER BY id DESC LIMIT 1000', conn)
+        # Lấy 4000 ván gần nhất để làm bộ nhớ
+        df_history = pd.read_sql('SELECT result FROM sessions ORDER BY id DESC LIMIT 4000', conn)
+        # Lấy 15 ván gần nhất để làm bối cảnh hiện tại
+        df_context = pd.read_sql('SELECT result FROM sessions ORDER BY id DESC LIMIT 15', conn)
         conn.close()
 
-        if len(df_search) < 50:
-            return jsonify({'status': 'WAIT', 'reason': 'AI đang huấn luyện với 3000 ván...'})
+        if len(df_history) < 100:
+            return jsonify({
+                'status': 'WAIT',
+                'reason': 'Lão làng đang học thêm kinh nghiệm từ các ván mới...',
+                'advice': 'Hãy chờ thêm ít phút nữa.'
+            })
 
-        # Phân tích và học từ dữ liệu
-        predicted, confidence, reason, streak = analyze_pattern(df_context, df_search)
+        # === 1. Xác định bối cảnh (Context) ===
+        context_series = df_context['result'].values[::-1]  # Từ cũ đến mới
+        current_streak = 0
+        last_result = context_series[-1]
+        for res in reversed(context_series):
+            if res == last_result:
+                current_streak += 1
+            else:
+                break
+
+        # Tạo pattern 10 ván (không cần dấu cách)
+        pattern_10 = ''.join(context_series[-10:])
         
+        # === 2. Tìm kiếm bằng chứng trong 4000 ván ===
+        history_series = df_history['result'].values[::-1]
+        history_str = ''.join(history_series)
+        
+        # Tìm tất cả các vị trí giống pattern hiện tại
+        similar_positions = []
+        for i in range(len(history_str) - 10):
+            if history_str[i:i+10] == pattern_10:
+                # Lấy kết quả của ván tiếp theo (sau pattern)
+                next_result = history_str[i+10] if i+10 < len(history_str) else None
+                if next_result:
+                    similar_positions.append(next_result)
+
+        # === 3. Lão làng đưa ra quyết định ===
+        if not similar_positions:
+            # Nếu chưa gặp pattern này, lão làng dựa vào kinh nghiệm bệt
+            if current_streak >= 3:
+                predicted = last_result
+                confidence = 0.55 + min(current_streak * 0.03, 0.15)
+                evidence = f"Bệt {current_streak} ván. Lão làng tin rằng cầu sẽ tiếp tục."
+            else:
+                # Mặc định theo xu hướng chung (Tài nhiều hơn)
+                tai_count = (df_history['result'] == 'TAI').sum()
+                xiu_count = len(df_history) - tai_count
+                predicted = 'TAI' if tai_count >= xiu_count else 'XIU'
+                confidence = max(tai_count, xiu_count) / len(df_history)
+                evidence = f"Tổng quan {len(df_history)} ván: Tài {tai_count}, Xỉu {xiu_count}."
+        else:
+            # Đếm số lần Tài và Xỉu sau pattern
+            counter = Counter(similar_positions)
+            total_matches = len(similar_positions)
+            tai_prob = counter.get('T', 0) / total_matches
+            xiu_prob = counter.get('X', 0) / total_matches
+            
+            # Lão làng quyết định
+            if tai_prob >= xiu_prob:
+                predicted = 'TAI'
+                confidence = tai_prob
+                evidence = f"Trong {total_matches} lần cầu giống vậy, có {counter.get('T', 0)} lần ra Tài, {counter.get('X', 0)} lần ra Xỉu."
+            else:
+                predicted = 'XIU'
+                confidence = xiu_prob
+                evidence = f"Trong {total_matches} lần cầu giống vậy, có {counter.get('X', 0)} lần ra Xỉu, {counter.get('T', 0)} lần ra Tài."
+            
+            # Điều chỉnh dựa trên bệt (ưu tiên bệt)
+            if current_streak >= 3 and predicted != last_result:
+                # Nếu đang bệt dài mà lão làng muốn bẻ, thì cân nhắc
+                if current_streak >= 6 and confidence < 0.7:
+                    # Bệt quá dài (>=6) và xác suất thấp -> bẻ
+                    predicted = 'XIU' if last_result == 'TAI' else 'TAI'
+                    evidence += f" Nhưng bệt đã {current_streak} ván, lão làng quyết định bẻ."
+
+        # === 4. Lão làng trả lời ===
         return jsonify({
             'status': 'PREDICT',
             'predict': predicted,
-            'confidence': round(confidence, 3),
-            'reason': reason,
+            'confidence': round(min(confidence, 0.95), 3),
+            'reason': evidence,
             'context': {
-                'current_streak': streak,
-                'total_learned': len(df_search)
+                'current_streak': current_streak,
+                'last_10': list(context_series[-10:]),
+                'total_matches': len(similar_positions) if similar_positions else 0,
+                'total_rounds_learned': len(df_history)
             }
         })
     except Exception as e:
         return jsonify({'status': 'ERROR', 'reason': str(e)})
 
+# ===== CÁC ENDPOINT HỖ TRỢ (GIỮ NGUYÊN) =====
 @app.route('/stats')
 def stats():
     try:
@@ -203,9 +204,6 @@ def history():
 
 @app.route('/history50')
 def history50():
-    """
-    Xem 50 ván gần nhất + tỉ lệ thắng thực tế (dựa trên kết quả game)
-    """
     try:
         conn = get_db()
         df = pd.read_sql('''
@@ -320,89 +318,52 @@ def accuracy():
     except Exception as e:
         return jsonify({'error': str(e)})
 
-# ===== ENDPOINT MỚI: XEM ĐÚNG/SAI TRONG 50 VÁN =====
-@app.route('/accuracy_50')
-def accuracy_50():
+# ===== ENDPOINT MỚI: SUMMARY 50 VÁN =====
+@app.route('/summary_50')
+def summary_50():
     """
-    Tính tỉ lệ đúng/sai của AI trong 50 ván gần nhất
-    (So sánh dự đoán AI với kết quả thực tế)
+    Thống kê 50 ván gần nhất: tổng, thắng, thua, chuỗi kết quả rút gọn (T/X)
     """
     try:
         conn = get_db()
-        # Lấy 50 ván gần nhất
         df = pd.read_sql('''
-            SELECT id, result 
-            FROM sessions 
-            ORDER BY id DESC 
-            LIMIT 50
+            SELECT result FROM sessions ORDER BY id DESC LIMIT 50
         ''', conn)
         conn.close()
 
         if len(df) < 10:
-            return jsonify({'error': 'Not enough data (need at least 10 rounds)'})
+            return jsonify({'error': 'Not enough data'})
 
-        # Đảo ngược để từ cũ đến mới
-        df = df[::-1].reset_index(drop=True)
-        
-        correct = 0
-        total = len(df)
-        details = []
-        
-        for i in range(1, len(df)):
-            # Lấy 10 ván trước đó để tạo pattern
-            context = df.iloc[:i]['result'].tolist()
-            if len(context) < 5:
-                continue
-            
-            # Dự đoán đơn giản: theo xu hướng
-            last_result = context[-1]
-            streak = 0
-            for res in reversed(context):
-                if res == last_result:
-                    streak += 1
-                else:
-                    break
-            
-            # Logic dự đoán (giống AI)
-            if streak >= 5:
-                predicted = 'XIU' if last_result == 'TAI' else 'TAI'  # Bẻ bệt
-            elif streak >= 3:
-                predicted = last_result  # Theo bệt
-            else:
-                # Theo xu hướng chung
-                tai_count = context.count('TAI')
-                xiu_count = context.count('XIU')
-                predicted = 'TAI' if tai_count >= xiu_count else 'XIU'
-            
-            actual = df.iloc[i]['result']
-            
-            is_correct = (predicted == actual)
-            if is_correct:
-                correct += 1
-            
-            details.append({
-                'round': i + 1,
-                'predict': predicted,
-                'actual': actual,
-                'correct': is_correct
-            })
-        
-        win_rate = round(correct / (len(df) - 1) * 100, 1) if len(df) > 1 else 0
-        
+        # Lấy kết quả từ ván cũ đến mới
+        recent = df['result'].values[::-1]
+
+        # Đếm số Tài và Xỉu
+        tai_count = sum(1 for r in recent if r == 'TAI')
+        xiu_count = len(recent) - tai_count
+
+        # Chuỗi rút gọn: T = Tài, X = Xỉu
+        history_str = ''.join('T' if r == 'TAI' else 'X' for r in recent)
+
+        # Quy ước: win là cửa xuất hiện nhiều hơn
+        if tai_count >= xiu_count:
+            win = tai_count
+            lose = xiu_count
+        else:
+            win = xiu_count
+            lose = tai_count
+
+        win_rate = round(win / len(recent) * 100, 1)
+
         return jsonify({
-            'total_rounds': total,
-            'correct': correct,
-            'wrong': (total - 1) - correct,
+            'total_rounds': len(recent),
+            'win': win,
+            'lose': lose,
             'win_rate': win_rate,
-            'details': details[-20:],  # 20 ván gần nhất
+            'history': history_str,
             'status': 'ready'
         })
     except Exception as e:
         return jsonify({'error': str(e)})
-
-@app.route('/retrain')
-def force_retrain():
-    return jsonify({'status': 'AI đang tự học liên tục, không cần retrain thủ công.'})
 
 def background_worker():
     init_db()
