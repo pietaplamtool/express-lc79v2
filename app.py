@@ -74,11 +74,14 @@ def analyze_flow(sequence):
     if len(sequence) < 8:
         return {'status': 'learning', 'advice': 'Đang quan sát...'}
     
+    # Chuyển đổi sang list để an toàn
+    seq_list = list(sequence)
+    
     # 1. Đo độ dài bệt trung bình
     streak_lengths = []
     current_streak = 1
-    for i in range(1, len(sequence)):
-        if sequence[i] == sequence[i-1]:
+    for i in range(1, len(seq_list)):
+        if seq_list[i] == seq_list[i-1]:
             current_streak += 1
         else:
             streak_lengths.append(current_streak)
@@ -88,28 +91,27 @@ def analyze_flow(sequence):
     
     # 2. Đo tần suất đảo
     reversals = 0
-    for i in range(1, len(sequence)):
-        if sequence[i] != sequence[i-1]:
+    for i in range(1, len(seq_list)):
+        if seq_list[i] != seq_list[i-1]:
             reversals += 1
-    reversal_freq = reversals / len(sequence)
+    reversal_freq = reversals / len(seq_list) if len(seq_list) > 0 else 0
     
     # 3. Đo mức độ lệch
-    tai_count = sequence.count('T')
-    xiu_count = sequence.count('X')
-    bias = tai_count / len(sequence)  # 0.5 là cân bằng, >0.5 là lệch Tài, <0.5 là lệch Xỉu
+    tai_count = seq_list.count('T')
+    xiu_count = seq_list.count('X')
+    bias = tai_count / len(seq_list) if len(seq_list) > 0 else 0.5
     
-    # 4. Đo độ biến động (dựa trên độ lệch chuẩn của các streak)
+    # 4. Đo độ biến động
     volatility = np.std(streak_lengths) if len(streak_lengths) > 1 else 0
     
     # 5. Phát hiện tín hiệu gãy
     break_signal = False
-    if len(sequence) >= 3:
-        last_three = sequence[-3:]
+    if len(seq_list) >= 3:
+        last_three = seq_list[-3:]
         if last_three[0] == last_three[1] != last_three[2]:
-            # Kiểm tra xem streak trước đó có dài không
             prev_streak = 1
-            for i in range(len(sequence)-3, 0, -1):
-                if sequence[i] == sequence[i-1]:
+            for i in range(len(seq_list)-3, 0, -1):
+                if seq_list[i] == seq_list[i-1]:
                     prev_streak += 1
                 else:
                     break
@@ -119,7 +121,6 @@ def analyze_flow(sequence):
     # Xác định chiến thuật
     strategy = {}
     if volatility < 0.5 and (bias > 0.65 or bias < 0.35):
-        # Cầu đang bệt và có xu hướng rõ
         trend = 'TAI' if bias > 0.5 else 'XIU'
         strategy = {
             'type': 'STRONG_TREND',
@@ -128,8 +129,7 @@ def analyze_flow(sequence):
             'action': 'FOLLOW_TREND'
         }
     elif reversal_freq > 0.4 and volatility < 0.8:
-        # Cầu đang đảo đều
-        last = sequence[-1]
+        last = seq_list[-1]
         next_pred = 'XIU' if last == 'T' else 'TAI'
         strategy = {
             'type': 'REVERSAL',
@@ -138,7 +138,6 @@ def analyze_flow(sequence):
             'action': 'REVERSE'
         }
     elif break_signal:
-        # Có dấu hiệu gãy
         strategy = {
             'type': 'BREAK_SIGNAL',
             'advice': 'Phát hiện tín hiệu gãy cầu. Đang điều chỉnh...',
@@ -146,7 +145,6 @@ def analyze_flow(sequence):
             'action': 'WAIT_OR_REVERSE'
         }
     elif volatility > 1.0:
-        # Cầu đang loạn
         strategy = {
             'type': 'CHOPPY',
             'advice': 'Cầu đang rất loạn, nên quan sát và giảm cược.',
@@ -154,7 +152,6 @@ def analyze_flow(sequence):
             'action': 'WAIT'
         }
     else:
-        # Mặc định: cân bằng
         strategy = {
             'type': 'NEUTRAL',
             'advice': 'Cầu đang trong giai đoạn trung lập.',
@@ -169,7 +166,7 @@ def analyze_flow(sequence):
         'volatility': volatility,
         'break_signal': break_signal,
         'strategy': strategy,
-        'last_result': sequence[-1]
+        'last_result': seq_list[-1] if seq_list else 'T'
     }
 
 @app.route('/predict')
@@ -286,7 +283,7 @@ def predict():
     except Exception as e:
         return jsonify({'status': 'ERROR', 'reason': str(e)})
 
-# ===== GIỮ NGUYÊN CÁC ENDPOINT CŨ =====
+# ===== CÁC ENDPOINT HỖ TRỢ =====
 @app.route('/stats')
 def stats():
     try:
