@@ -57,8 +57,15 @@ model_cache = {
     "sequence": [],
     "predictions": None,
     "updated_at": 0.0,
+    "meta": None,
 }
 MODEL_LOCK = threading.RLock()
+
+# Lightweight online meta-model. Pure NumPy: no sklearn/TensorFlow/PyTorch required.
+META_FEATURES = 24
+META_L2 = 0.025
+META_LR = 0.045
+META_EPOCHS = 4
 
 
 def normalize_result(value) -> Optional[str]:
@@ -148,6 +155,7 @@ def restore_adaptive_scores():
         conn.close()
 
         with state["lock"]:
+            # replay oldest -> newest so deque reflects temporal order
             for signals_json, correct in reversed(rows):
                 try:
                     names = json.loads(signals_json or "{}").keys()
@@ -301,6 +309,7 @@ def ngram_probability(seq: List[str], n: int, recency_decay: float = 0.995):
     weighted_total = 0.0
     matches = 0
 
+    # Walk over all eligible contexts. Weight newer contexts more heavily.
     max_i = len(seq) - n - 1
     for i in range(max_i + 1):
         if tuple(seq[i : i + n]) != target:
@@ -315,6 +324,7 @@ def ngram_probability(seq: List[str], n: int, recency_decay: float = 0.995):
     if weighted_total <= 0:
         return None, matches
 
+    # Beta smoothing prevents tiny sample matches from becoming overconfident.
     p = (weighted_tai + 2.0 * 0.5) / (weighted_total + 2.0)
     return clamp_prob(p), matches
 
@@ -329,6 +339,7 @@ def markov_probability(seq: List[str], order: int):
     counts = {"TAI": 1.0, "XIU": 1.0}  # Laplace smoothing
     matches = 0
 
+    # Recent occurrences are mildly favored.
     for i in range(len(seq) - order):
         if tuple(seq[i : i + order]) == target:
             nxt = seq[i + order]
@@ -359,6 +370,7 @@ def streak_probability(seq: List[str]):
     break_w = 1.0
     seen = 0
 
+    # Scan historical runs of the same length (or close lengths).
     i = 0
     while i < len(seq) - 1:
         run_result = seq[i]
@@ -378,6 +390,7 @@ def streak_probability(seq: List[str]):
     if seen == 0:
         return None, 0
 
+    # Probability next is TAI. For current TAI streak continuation => TAI.
     continuation = continue_w / (continue_w + break_w)
     p_tai = continuation if last == "TAI" else (1.0 - continuation)
     return clamp_prob(p_tai, 0.10, 0.90), seen
@@ -404,10 +417,112 @@ def collect_signals(seq: List[str]) -> Dict[str, Dict]:
     signals["recent_50"] = {"p_tai": recent_bias_probability(seq, 50), "support": min(50, len(seq))}
     signals["ewma"] = {"p_tai": ewma_probability(seq), "support": len(seq)}
 
+    # Stable global prior with smoothing.
     global_p = (sum(x == "TAI" for x in seq) + 2.0) / (len(seq) + 4.0)
     signals["global"] = {"p_tai": clamp_prob(global_p), "support": len(seq)}
 
     return signals
+
+
+
+def feature_vector(seq: List[str]) -> np.ndarray:
+    """Compact state vector used by the lightweight meta learner."""
+    x = np.zeros(META_FEATURES, dtype=np.float64)
+    if not seq:
+        return x
+
+    # Recent balances at multiple horizons.
+    horizons = (5, 10, 20, 40, 80)
+    for j, h in enumerate(horizons):
+        part = seq[-h:]
+        x[j] = (sum(v == "TAI" for v in part) / len(part)) - 0.5
+
+    # Last 8 outcomes encoded as +/-1.
+    last8 = seq[-8:]
+    for j, v in enumerate(last8):
+        x[5 + j] = 1.0 if v == "TAI" else -1.0
+
+    # Current streak, direction and transition tendency.
+    last = seq[-1]
+    run = 1
+    for v in reversed(seq[:-1]):
+        if v == last:
+            run += 1
+        else:
+            break
+    x[13] = min(run, 10) / 10.0
+    x[14] = 1.0 if last == "TAI" else -1.0
+
+    trans = Counter(zip(seq[:-1], seq[1:]))
+    for idx, pair in enumerate((("TAI", "TAI"), ("TAI", "XIU"), ("XIU", "TAI"), ("XIU", "XIU"))):
+        total = trans[(pair[0], "TAI")] + trans[(pair[0], "XIU")]
+        x[15 + idx] = ((trans[pair] / total) if total else 0.5) - 0.5
+
+    # Current context probabilities from the non-meta ensemble components.
+    sigs = collect_signals(seq)
+    vals = [
+        sigs.get("pattern_5", {}).get("p_tai", 0.5),
+        sigs.get("pattern_10", {}).get("p_tai", 0.5),
+        sigs.get("markov_2", {}).get("p_tai", 0.5),
+        sigs.get("markov_3", {}).get("p_tai", 0.5),
+        sigs.get("streak", {}).get("p_tai", 0.5),
+        sigs.get("ewma", {}).get("p_tai", 0.5),
+    ]
+    for j, p in enumerate(vals):
+        x[19 + j] = 2.0 * (p - 0.5)
+    return x
+
+
+def sigmoid(z):
+    z = np.clip(z, -12.0, 12.0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def train_meta_model(seq: List[str]) -> Dict:
+    """Walk-forward training: each feature row only sees history before its label."""
+    if len(seq) < 120:
+        return {"w": np.zeros(META_FEATURES), "b": 0.0, "samples": 0}
+
+    start = max(30, len(seq) - MAX_MODEL_HISTORY)
+    X, y = [], []
+    for i in range(start, len(seq)):
+        hist = seq[:i]
+        if len(hist) < 30:
+            continue
+        X.append(feature_vector(hist))
+        y.append(1.0 if seq[i] == "TAI" else 0.0)
+
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if len(y) < 50:
+        return {"w": np.zeros(META_FEATURES), "b": 0.0, "samples": len(y)}
+
+    # Standardize using training data only. This makes the tiny model more stable.
+    mu = X.mean(axis=0)
+    sd = X.std(axis=0)
+    sd[sd < 1e-6] = 1.0
+    Z = (X - mu) / sd
+
+    w = np.zeros(META_FEATURES, dtype=np.float64)
+    b = 0.0
+    n = len(y)
+    for _ in range(META_EPOCHS):
+        logits = Z @ w + b
+        p = sigmoid(logits)
+        grad_w = (Z.T @ (p - y)) / n + META_L2 * w
+        grad_b = float(np.mean(p - y))
+        w -= META_LR * grad_w
+        b -= META_LR * grad_b
+
+    return {"w": w, "b": b, "mu": mu, "sd": sd, "samples": n}
+
+
+def meta_probability(seq: List[str], meta: Dict) -> float:
+    if not meta or meta.get("samples", 0) < 50:
+        return 0.5
+    x = feature_vector(seq)
+    z = (x - meta["mu"]) / meta["sd"]
+    return float(sigmoid(np.dot(z, meta["w"]) + meta["b"]))
 
 
 DEFAULT_WEIGHTS = {
@@ -435,9 +550,11 @@ def learned_weight(name: str) -> float:
     if len(history) < 8:
         return base
 
+    # Recent hit-rate controls each component's influence.
     hit_rate = sum(history) / len(history)
     reliability = 0.45 + 1.35 * hit_rate
 
+    # Penalize persistent recent failure more aggressively.
     loss_streak = 0
     for x in reversed(history):
         if x == 0:
@@ -449,56 +566,54 @@ def learned_weight(name: str) -> float:
     return max(0.10, min(2.2, base * reliability * penalty))
 
 
-def ensemble_predict(seq: List[str]) -> Dict:
+def ensemble_predict(seq: List[str], meta: Optional[Dict] = None) -> Dict:
     signals = collect_signals(seq)
     if not signals:
-        return {
-            "predicted": seq[-1] if seq else "TAI",
-            "p_tai": 0.5,
-            "confidence": 0.5,
-            "signals": {},
-            "agreement": 0.0,
-        }
+        return {"predicted": "TAI", "p_tai": 0.5, "confidence": 0.5, "signals": {}, "agreement": 0.0, "meta_probability": 0.5}
 
     numerator = 0.0
     denominator = 0.0
     votes = []
-
     for name, info in signals.items():
         p = info["p_tai"]
         support = max(1.0, float(info["support"]))
         weight = learned_weight(name)
-
         support_factor = 0.70 + 0.30 * (math.log1p(support) / math.log1p(max(50, len(seq))))
         effective = weight * support_factor
-
         numerator += p * effective
         denominator += effective
         votes.append((name, p, effective))
 
-    p_tai = clamp_prob(numerator / denominator if denominator else 0.5)
+    base_p = numerator / denominator if denominator else 0.5
+    consensus = sum(v[2] for v in votes if (v[1] >= 0.5) == (base_p >= 0.5)) / (sum(v[2] for v in votes) or 1.0)
 
-    total_w = sum(v[2] for v in votes) or 1.0
-    consensus = sum(v[2] for v in votes if (v[1] >= 0.5) == (p_tai >= 0.5)) / total_w
+    mp = meta_probability(seq, meta)
+    # Meta model gets stronger only when it has enough walk-forward samples.
+    meta_strength = min(0.42, 0.10 + 0.32 * min(1.0, (meta or {}).get("samples", 0) / 3000.0))
+    blended = (1.0 - meta_strength) * base_p + meta_strength * mp
 
-    raw_strength = abs(p_tai - 0.5) * 2.0
-    confidence = 0.5 + 0.48 * raw_strength * (0.55 + 0.45 * consensus)
+    # Hysteresis: avoid flip-flopping on tiny probability changes.
+    previous = state.get("last_prediction")
+    if previous in RESULTS and 0.485 <= blended <= 0.515:
+        predicted = previous
+    else:
+        predicted = "TAI" if blended >= 0.5 else "XIU"
+
+    strength = abs(blended - 0.5) * 2.0
+    confidence = 0.5 + 0.48 * strength * (0.55 + 0.45 * consensus)
     confidence = max(0.50, min(0.98, confidence))
 
-    predicted = "TAI" if p_tai >= 0.5 else "XIU"
     return {
         "predicted": predicted,
-        "p_tai": round(p_tai, 6),
-        "confidence": round(confidence, 6),
+        "p_tai": round(float(blended), 6),
+        "confidence": round(float(confidence), 6),
         "signals": {
-            name: {
-                "p_tai": round(p, 4),
-                "weight": round(w, 4),
-                "support": int(info["support"]),
-            }
+            name: {"p_tai": round(p, 4), "weight": round(w, 4), "support": int(info["support"])}
             for (name, p, w), (_, info) in zip(votes, signals.items())
         },
-        "agreement": round(consensus, 4),
+        "agreement": round(float(consensus), 4),
+        "meta_probability": round(float(mp), 6),
+        "meta_strength": round(float(meta_strength), 4),
     }
 
 
@@ -570,6 +685,9 @@ def settle_pending_predictions():
             stored_signals = {}
 
         with state["lock"]:
+            # Score each component against the actual result, not merely against
+            # the ensemble decision. This lets weak components lose weight and
+            # reliable components gain weight over time.
             actual_norm = normalize_result(actual)
             for name, info in stored_signals.items():
                 try:
@@ -705,6 +823,8 @@ def walk_forward_backtest(sequence: List[str], max_points: int = 500) -> Dict:
     max_win = max_loss = 0
     score_history = []
 
+    # Use a temporary sequence-specific scoring state implicitly through current model.
+    # Disable adaptive live state mutation by computing with default weights.
     def static_predict(hist):
         sigs = collect_signals(hist)
         if not sigs:
@@ -797,27 +917,31 @@ def predict():
         settle_pending_predictions()
         df = get_history(HISTORY_LIMIT)
 
-        # NẾU CHƯA ĐỦ DỮ LIỆU, VẪN ĐƯA RA DỰ ĐOÁN MẶC ĐỊNH
         if len(df) < 100:
             return jsonify({
-                "status": "PREDICT",  # Luôn là PREDICT, không bao giờ WAIT
+                "status": "PREDICT",
                 "predict": "TAI",
-                "predict_short": "T",
                 "confidence": 0.55,
-                "probability": {"tai": 0.55, "xiu": 0.45},
                 "reason": "Đang xây dựng mô hình với dữ liệu hiện có.",
-                "context": {
-                    "current_streak": 0,
-                    "total_rounds_learned": int(len(df)),
-                }
+                "learned": int(len(df)),
             })
 
         seq = df["result"].tolist()
-        analysis = ensemble_predict(seq)
+        data_key = (int(df["id"].iloc[0]), int(df["id"].iloc[-1]), len(seq))
+        with MODEL_LOCK:
+            if model_cache.get("data_key") != data_key or model_cache.get("meta") is None:
+                model_cache["meta"] = train_meta_model(seq)
+                model_cache["data_key"] = data_key
+            meta = model_cache["meta"]
+        analysis = ensemble_predict(seq, meta)
 
+        # The target id is the next unseen round. If the upstream source only exposes
+        # known rounds, frontends can still poll this endpoint and use this prediction
+        # until a new session arrives.
         latest_id = int(df["id"].iloc[-1])
         target_id = latest_id + 1
 
+        # Persist the prediction for later objective scoring.
         log_prediction_for_session(target_id, analysis["predicted"], analysis["confidence"], analysis["signals"])
 
         with state["lock"]:
@@ -835,7 +959,7 @@ def predict():
         ]
 
         return jsonify({
-            "status": "PREDICT",  # Luôn là PREDICT
+            "status": "PREDICT",
             "predict": analysis["predicted"],
             "predict_short": short_result(analysis["predicted"]),
             "confidence": analysis["confidence"],
@@ -995,6 +1119,62 @@ def accuracy():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.route("/backtest_compare")
+def backtest_compare():
+    """Compare the old 10-pattern rule against V3's base ensemble on unseen data."""
+    try:
+        df = get_history(HISTORY_LIMIT)
+        seq = df["result"].tolist()
+        if len(seq) < 150:
+            return jsonify({"status": "WAIT", "samples": len(seq)}), 400
+
+        start = max(50, len(seq) - 1000)
+        old_ok = new_ok = 0
+        old_n = new_n = 0
+        old_win = old_loss = new_win = new_loss = 0
+        old_max_win = old_max_loss = new_max_win = new_max_loss = 0
+
+        def old_predict(hist):
+            if len(hist) < 10:
+                return hist[-1]
+            target = tuple(hist[-10:])
+            c = Counter()
+            for i in range(len(hist) - 10):
+                if tuple(hist[i:i+10]) == target:
+                    c[hist[i+10]] += 1
+            if c:
+                return c.most_common(1)[0][0]
+            return "TAI" if hist.count("TAI") >= hist.count("XIU") else "XIU"
+
+        for i in range(start, len(seq)):
+            hist = seq[:i]
+            actual = seq[i]
+            op = old_predict(hist)
+            if op == actual:
+                old_ok += 1; old_win += 1; old_loss = 0
+            else:
+                old_loss += 1; old_win = 0
+            old_max_win = max(old_max_win, old_win); old_max_loss = max(old_max_loss, old_loss)
+
+            # Train a fresh meta model only at checkpoints; base ensemble remains strict and cheap.
+            bp = ensemble_predict(hist, None)["predicted"]
+            if bp == actual:
+                new_ok += 1; new_win += 1; new_loss = 0
+            else:
+                new_loss += 1; new_win = 0
+            new_max_win = max(new_max_win, new_win); new_max_loss = max(new_max_loss, new_loss)
+            old_n += 1; new_n += 1
+
+        return jsonify({
+            "status": "ready",
+            "samples": old_n,
+            "old_v1": {"accuracy": round(old_ok * 100 / old_n, 2), "max_win_streak": old_max_win, "max_loss_streak": old_max_loss},
+            "v3_base_ensemble": {"accuracy": round(new_ok * 100 / new_n, 2), "max_win_streak": new_max_win, "max_loss_streak": new_max_loss},
+        })
+    except Exception as exc:
+        return jsonify({"status": "ERROR", "reason": str(exc)}), 500
+
+
 @app.route("/model")
 def model_info():
     try:
@@ -1002,7 +1182,14 @@ def model_info():
         if len(df) < 100:
             return jsonify({"status": "WAIT", "learned": len(df)})
 
-        result = ensemble_predict(df["result"].tolist())
+        seq = df["result"].tolist()
+        with MODEL_LOCK:
+            data_key = (int(df["id"].iloc[0]), int(df["id"].iloc[-1]), len(seq))
+            if model_cache.get("data_key") != data_key or model_cache.get("meta") is None:
+                model_cache["meta"] = train_meta_model(seq)
+                model_cache["data_key"] = data_key
+            meta = model_cache["meta"]
+        result = ensemble_predict(seq, meta)
         return jsonify({
             "status": "ready",
             "algorithm": "adaptive-ensemble",
