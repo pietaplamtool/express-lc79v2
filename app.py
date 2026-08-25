@@ -62,7 +62,7 @@ model_cache = {
 MODEL_LOCK = threading.RLock()
 
 # Lightweight online meta-model. Pure NumPy: no sklearn/TensorFlow/PyTorch required.
-META_FEATURES = 24
+META_FEATURES = 25
 META_L2 = 0.025
 META_LR = 0.045
 META_EPOCHS = 4
@@ -919,10 +919,8 @@ def predict():
 
         if len(df) < 100:
             return jsonify({
-                "status": "PREDICT",
-                "predict": "TAI",
-                "confidence": 0.55,
-                "reason": "Đang xây dựng mô hình với dữ liệu hiện có.",
+                "status": "WAIT",
+                "reason": "Chưa đủ dữ liệu để xây mô hình.",
                 "learned": int(len(df)),
             })
 
