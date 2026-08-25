@@ -66,6 +66,7 @@ META_FEATURES = 25
 META_L2 = 0.025
 META_LR = 0.045
 META_EPOCHS = 4
+META_REFRESH_ROUNDS = int(os.getenv("META_REFRESH_ROUNDS", "100"))
 
 
 def normalize_result(value) -> Optional[str]:
@@ -479,25 +480,84 @@ def sigmoid(z):
 
 
 def train_meta_model(seq: List[str]) -> Dict:
-    """Walk-forward training: each feature row only sees history before its label."""
+    """Fast walk-forward meta learner.
+
+    IMPORTANT: this training path intentionally does NOT call collect_signals()
+    for every historical row. The old implementation did that, making training
+    roughly quadratic in the number of rounds and causing Render request timeouts.
+    """
     if len(seq) < 120:
-        return {"w": np.zeros(META_FEATURES), "b": 0.0, "samples": 0}
+        return {"w": np.zeros(META_FEATURES), "b": 0.0,
+                "mu": np.zeros(META_FEATURES), "sd": np.ones(META_FEATURES), "samples": 0}
 
     start = max(30, len(seq) - MAX_MODEL_HISTORY)
     X, y = [], []
-    for i in range(start, len(seq)):
-        hist = seq[:i]
-        if len(hist) < 30:
+
+    # Prefix transition counts: updated once per row, so feature generation is O(1).
+    trans = Counter()
+    tai_total = 0
+    xiu_total = 0
+    run_len = 0
+    prev = None
+
+    for i, value in enumerate(seq):
+        value = normalize_result(value)
+        if value is None:
             continue
-        X.append(feature_vector(hist))
-        y.append(1.0 if seq[i] == "TAI" else 0.0)
+
+        if prev == value:
+            run_len += 1
+        else:
+            run_len = 1
+
+        if i >= start and i >= 30:
+            x = np.zeros(META_FEATURES, dtype=np.float64)
+            horizons = (5, 10, 20, 40, 80)
+            for j, h in enumerate(horizons):
+                part = seq[max(0, i-h):i]
+                if part:
+                    x[j] = sum(v == "TAI" for v in part) / len(part) - 0.5
+
+            last8 = seq[max(0, i-8):i]
+            for j, v in enumerate(last8):
+                x[5 + j] = 1.0 if v == "TAI" else -1.0
+
+            x[13] = min(run_len, 10) / 10.0
+            x[14] = 1.0 if prev == "TAI" else -1.0
+
+            # Conditional transition tendencies learned only from the prefix.
+            for idx, pair in enumerate((("TAI", "TAI"), ("TAI", "XIU"),
+                                        ("XIU", "TAI"), ("XIU", "XIU"))):
+                denom = trans[(pair[0], "TAI")] + trans[(pair[0], "XIU")]
+                x[15 + idx] = (trans[pair] / denom if denom else 0.5) - 0.5
+
+            # Cheap context features; the expensive pattern search is reserved
+            # for the live prediction, where it is executed only once per poll.
+            for j, h in enumerate((20, 50)):
+                part = seq[max(0, i-h):i]
+                x[19 + j] = 2.0 * ((sum(v == "TAI" for v in part) / len(part) if part else 0.5) - 0.5)
+            x[21] = 2.0 * ((tai_total / (tai_total + xiu_total)) - 0.5) if (tai_total + xiu_total) else 0.0
+            x[22] = min(run_len, 10) / 10.0
+            x[23] = 1.0 if prev == "TAI" else -1.0
+            x[24] = 0.0
+
+            X.append(x)
+            y.append(1.0 if value == "TAI" else 0.0)
+
+        if prev is not None:
+            trans[(prev, value)] += 1
+        if value == "TAI":
+            tai_total += 1
+        else:
+            xiu_total += 1
+        prev = value
+
+    if len(y) < 50:
+        return {"w": np.zeros(META_FEATURES), "b": 0.0,
+                "mu": np.zeros(META_FEATURES), "sd": np.ones(META_FEATURES), "samples": len(y)}
 
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
-    if len(y) < 50:
-        return {"w": np.zeros(META_FEATURES), "b": 0.0, "samples": len(y)}
-
-    # Standardize using training data only. This makes the tiny model more stable.
     mu = X.mean(axis=0)
     sd = X.std(axis=0)
     sd[sd < 1e-6] = 1.0
@@ -507,8 +567,7 @@ def train_meta_model(seq: List[str]) -> Dict:
     b = 0.0
     n = len(y)
     for _ in range(META_EPOCHS):
-        logits = Z @ w + b
-        p = sigmoid(logits)
+        p = sigmoid(Z @ w + b)
         grad_w = (Z.T @ (p - y)) / n + META_L2 * w
         grad_b = float(np.mean(p - y))
         w -= META_LR * grad_w
@@ -927,9 +986,16 @@ def predict():
         seq = df["result"].tolist()
         data_key = (int(df["id"].iloc[0]), int(df["id"].iloc[-1]), len(seq))
         with MODEL_LOCK:
-            if model_cache.get("data_key") != data_key or model_cache.get("meta") is None:
+            old_key = model_cache.get("data_key")
+            old_meta = model_cache.get("meta")
+            old_id = old_key[1] if old_key else 0
+            refresh_due = (old_meta is None or
+                           latest_id - int(old_id or 0) >= META_REFRESH_ROUNDS or
+                           time.time() - float(model_cache.get("updated_at", 0.0)) >= 300)
+            if refresh_due:
                 model_cache["meta"] = train_meta_model(seq)
                 model_cache["data_key"] = data_key
+                model_cache["updated_at"] = time.time()
             meta = model_cache["meta"]
         analysis = ensemble_predict(seq, meta)
 
