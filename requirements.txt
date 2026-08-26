@@ -14,3 +14,5 @@ xgboost
 lightgbm
 scipy
 joblib
+python-telegram-bot==20.0
+requests
