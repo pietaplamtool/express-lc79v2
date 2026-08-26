@@ -267,6 +267,105 @@ def fetch_and_save():
 
 
 # -----------------------------------------------------------------------------
+# V4: state / flow recognizer
+# -----------------------------------------------------------------------------
+def _run_len(seq):
+    if not seq: return 0
+    last = seq[-1]; n = 1
+    for v in reversed(seq[:-1]):
+        if v == last: n += 1
+        else: break
+    return n
+
+def _run_lengths(seq, max_runs=12):
+    if not seq: return []
+    out=[]; last=seq[0]; n=1
+    for v in seq[1:]:
+        if v == last: n += 1
+        else:
+            out.append((last,n)); last=v; n=1
+    out.append((last,n))
+    return out[-max_runs:]
+
+def classify_state(seq):
+    """Describe the current flow state using only the observed prefix."""
+    if len(seq) < 6: return "UNKNOWN"
+    r = _run_len(seq)
+    runs = _run_lengths(seq, 10)
+    lens = [n for _,n in runs]
+    alt_tail = 1
+    for i in range(len(seq)-1, 0, -1):
+        if seq[i] != seq[i-1]: alt_tail += 1
+        else: break
+    alt = sum(seq[i] != seq[i-1] for i in range(1,len(seq))) / max(1,len(seq)-1)
+    if r >= 7: return "BET_7P"
+    if r >= 5: return "BET_5_6"
+    if r >= 3: return "BET_3_4"
+    if alt_tail >= 8: return "DAO_1_1_LONG"
+    if alt_tail >= 5: return "DAO_1_1"
+    if len(lens) >= 4 and lens[-4:] == [2,2,2,2]: return "DAO_2_2"
+    if len(lens) >= 3 and lens[-3:] == [3,3,3]: return "DAO_3_3"
+    if len(lens) >= 3 and lens[-3:] == [1,2,1]: return "MIX_1_2_1"
+    if len(lens) >= 3 and lens[-3:] == [2,1,2]: return "MIX_2_1_2"
+    if len(runs) >= 2 and runs[-2][1] >= 4 and runs[-1][1] <= 2: return "BREAK_BET"
+    if len(runs) >= 3 and runs[-3][1] >= 3 and runs[-2][1] == 1 and runs[-1][1] <= 2: return "BREAK_CAU"
+    if alt >= 0.72: return "MIXED_FAST"
+    return "NEUTRAL"
+
+def state_signature(seq):
+    return (classify_state(seq), min(_run_len(seq),10), seq[-1] if seq else "TAI")
+
+def state_probability(seq, min_support=12):
+    """P(next=TAI) among historical prefixes with the same state signature."""
+    if len(seq) < 40: return None,0,None
+    target = state_signature(seq)
+    ct=cx=2.0; matches=0
+    for i in range(20, len(seq)-1):
+        hist=seq[:i]
+        if state_signature(hist) == target:
+            matches += 1
+            if seq[i] == "TAI": ct += 1
+            else: cx += 1
+    if matches < min_support: return None,matches,target[0]
+    return clamp_prob(ct/(ct+cx),0.08,0.92), matches, target[0]
+
+def break_signal_probability(seq, min_support=8):
+    """Learn continuation after a long-run break / double-break pattern."""
+    if len(seq) < 50: return None,0,"NONE"
+    runs=[]; i=0
+    while i < len(seq):
+        j=i+1
+        while j < len(seq) and seq[j] == seq[i]: j += 1
+        runs.append((i,j,seq[i],j-i)); i=j
+    cur_len=runs[-1][3]
+    if len(runs)>=2 and runs[-2][3]>=4 and cur_len<=2: typ="LONG_BREAK"
+    elif len(runs)>=3 and runs[-3][3]>=3 and runs[-2][3]==1 and cur_len<=2: typ="DOUBLE_BREAK"
+    else: return None,0,"NONE"
+    ct=cx=2.0; matches=0
+    for k in range(2,len(runs)-1):
+        a,b,c=runs[k-2],runs[k-1],runs[k]
+        nxt=runs[k+1]
+        old_type = "LONG_BREAK" if a[3] < 999 and b[3] <= 2 and a[3] >= 4 else None
+        if old_type == typ:
+            matches += 1
+            if nxt[2] == "TAI": ct += 1
+            else: cx += 1
+    if matches < min_support: return None,matches,typ
+    return clamp_prob(ct/(ct+cx),0.08,0.92), matches, typ
+
+def state_backtest(sequence, min_train=80):
+    """Walk-forward accuracy by state; future results are never used in features."""
+    stats=defaultdict(lambda:{"n":0,"correct":0})
+    for i in range(min_train,len(sequence)):
+        hist=sequence[:i]
+        p,n,name=state_probability(hist,min_support=8)
+        if p is None: continue
+        pred="TAI" if p>=0.5 else "XIU"
+        d=stats[name]; d["n"]+=1; d["correct"]+=int(pred==sequence[i])
+    return {k:{**v,"accuracy":round(100*v["correct"]/v["n"],2)} for k,v in stats.items() if v["n"]}
+
+
+# -----------------------------------------------------------------------------
 # Prediction engines
 # -----------------------------------------------------------------------------
 def clamp_prob(p: float, low: float = 0.02, high: float = 0.98) -> float:
@@ -413,6 +512,11 @@ def collect_signals(seq: List[str]) -> Dict[str, Dict]:
     streak_p, streak_support = streak_probability(seq)
     if streak_p is not None:
         signals["streak"] = {"p_tai": streak_p, "support": streak_support}
+
+    sp, ss, state_name = state_probability(seq)
+    signals["state"] = {"p_tai": sp if sp is not None else 0.5, "support": ss, "state": state_name}
+    bp, bs, break_name = break_signal_probability(seq)
+    signals["break"] = {"p_tai": bp if bp is not None else 0.5, "support": bs, "state": break_name}
 
     signals["recent_20"] = {"p_tai": recent_bias_probability(seq, 20), "support": min(20, len(seq))}
     signals["recent_50"] = {"p_tai": recent_bias_probability(seq, 50), "support": min(50, len(seq))}
@@ -595,6 +699,8 @@ DEFAULT_WEIGHTS = {
     "markov_2": 1.00,
     "markov_3": 1.05,
     "streak": 0.55,
+    "state": 1.10,
+    "break": 1.00,
     "recent_20": 0.75,
     "recent_50": 0.55,
     "ewma": 0.60,
@@ -1002,6 +1108,9 @@ def predict():
                 model_cache["updated_at"] = time.time()
             meta = model_cache["meta"]
         analysis = ensemble_predict(seq, meta)
+        current_state = classify_state(seq)
+        state_p, state_support, _ = state_probability(seq)
+        break_p, break_support, break_type = break_signal_probability(seq)
 
         # ALWAYS PREDICT: there is intentionally no loss-streak stop/lockout.
         # A losing streak only changes adaptive component weights; it never
@@ -1053,6 +1162,12 @@ def predict():
                     "volatility": round(float(flow["volatility"]), 3),
                 },
                 "total_rounds_learned": int(len(seq)),
+                "current_state": current_state,
+                "state_probability": round(state_p, 4) if state_p is not None else None,
+                "state_support": int(state_support),
+                "break_signal": break_type,
+                "break_probability": round(break_p, 4) if break_p is not None else None,
+                "break_support": int(break_support),
                 "recent_accuracy": recent_acc,
             },
             "signals": analysis["signals"],
@@ -1060,6 +1175,16 @@ def predict():
     except Exception as exc:
         return jsonify({"status": "ERROR", "reason": str(exc)}), 500
 
+
+@app.route("/state_backtest")
+def state_backtest_endpoint():
+    try:
+        df = get_history(HISTORY_LIMIT)
+        seq = [normalize_result(x) for x in df["result"].tolist()]
+        seq = [x for x in seq if x]
+        return jsonify({"status":"ready","samples":len(seq),"states":state_backtest(seq)})
+    except Exception as e:
+        return jsonify({"status":"ERROR","reason":str(e)}),500
 
 @app.route("/stats")
 def stats():
