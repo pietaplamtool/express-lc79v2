@@ -9,12 +9,12 @@ import requests
 import psycopg2
 import redis
 from flask import Flask, jsonify
-from flask_cors import CORS  # <--- THÊM DÒNG NÀY
+from flask_cors import CORS
 from dotenv import load_dotenv
 
 load_dotenv()
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # <--- THÊM DÒNG NÀY
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 DB_URL = os.getenv("DB_URL")
 REDIS_URL = os.getenv("REDIS_URL")
@@ -1067,6 +1067,18 @@ def summary_50():
         return jsonify({"error": str(exc)}), 500
 
 
+# ===== CHẠY AI VÀ TELEGRAM BOT SONG SONG =====
+def run_bot():
+    try:
+        os.system("python bot.py")
+    except Exception as e:
+        print(f"Lỗi bot: {e}")
+
+# Khởi chạy bot trong thread riêng
+if os.environ.get("RUN_BOT", "true").lower() == "true":
+    threading.Thread(target=run_bot, daemon=True).start()
+    print("[+] Telegram Bot đã được kích hoạt trong thread riêng.")
+
 def worker():
     try:
         init_db()
@@ -1084,4 +1096,5 @@ def worker():
 
 if __name__ == "__main__":
     threading.Thread(target=worker, daemon=True, name="data-worker").start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), threaded=True)
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port, threaded=True)
