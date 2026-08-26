@@ -1006,6 +1006,65 @@ def history50():
         return jsonify({"status": "ERROR", "reason": str(exc)}), 500
 
 
+# ===== ENDPOINT STREAK_20 =====
+@app.route("/streak_20")
+def streak_20():
+    try:
+        rows, _ = get_history()
+        recent = rows[-20:]
+        if len(recent) < 2:
+            return jsonify({"error": "Not enough data"}), 400
+        seq = [norm(r[1]) for r in recent]
+        max_tai = 0
+        max_xiu = 0
+        current_tai = 0
+        current_xiu = 0
+        for res in seq:
+            if res == "TAI":
+                current_tai += 1
+                current_xiu = 0
+                max_tai = max(max_tai, current_tai)
+            else:
+                current_xiu += 1
+                current_tai = 0
+                max_xiu = max(max_xiu, current_xiu)
+        return jsonify({
+            "max_win_streak_20": max_tai,
+            "max_loss_streak_20": max_xiu,
+            "total_tai": seq.count("TAI"),
+            "total_xiu": seq.count("XIU"),
+            "status": "ready",
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+# ===== ENDPOINT SUMMARY_50 =====
+@app.route("/summary_50")
+def summary_50():
+    try:
+        rows, _ = get_history()
+        recent = rows[-50:]
+        if len(recent) < 10:
+            return jsonify({"error": "Not enough data"}), 400
+        seq = [norm(r[1]) for r in recent]
+        tai = sum(x == "TAI" for x in seq)
+        xiu = len(seq) - tai
+        history_str = "".join(short(x) for x in seq)
+        win = max(tai, xiu)
+        lose = min(tai, xiu)
+        return jsonify({
+            "total_rounds": len(seq),
+            "win": win,
+            "lose": lose,
+            "win_rate": round(100.0 * win / len(seq), 1),
+            "history": history_str,
+            "status": "ready",
+        })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 def worker():
     try:
         init_db()
