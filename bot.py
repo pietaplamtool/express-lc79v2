@@ -2,7 +2,7 @@ import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = "8891039285:AAFBUBpmA8f0a7MoX8npE_LrXldSnK833ww"
+TOKEN = "8891039285:AAGuzG0fdsycHSsIhogbth3dvnzE16PTziw"
 API_URL = "https://bettv-predictor.onrender.com/predict"
 
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
