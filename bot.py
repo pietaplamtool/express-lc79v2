@@ -12,7 +12,7 @@ API_URL = "https://bettv-predictor.onrender.com/predict"
 GROUP_LINK = "https://t.me/kano_ai2026"
 logging.basicConfig(level=logging.INFO)
 
-# ===== DỮ LIỆU USER =====
+# ===== DỮ LIỆU USER (Lưu trong RAM) =====
 user_data = {}
 user_sessions = {}
 
@@ -62,6 +62,7 @@ def get_prediction():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
+    # Khởi tạo user data nếu chưa có
     if user_id not in user_data:
         user_data[user_id] = {
             "balance": 0,
@@ -70,7 +71,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "key_expiry": None
         }
     
-    # ID 7853432590 có sẵn 2.000.000đ và key test
+    # ID 7853432590 nhận 2.000.000đ và key test
     if user_id == 7853432590:
         user_data[user_id]["balance"] = 2000000
         user_data[user_id]["key"] = "TEST_KEY_001"
@@ -268,7 +269,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== MUA GÓI KEY =====
+# ===== MUA GÓI KEY (ĐÃ SỬA) =====
 async def show_key_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for key, pkg in KEY_PACKAGES.items():
@@ -289,8 +290,11 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     user_id = update.effective_user.id
-    pkg_key = query.data.split('_')[1]
-    pkg = KEY_PACKAGES[pkg_key]
+    pkg_key = query.data.replace("buykey_", "")
+    pkg = KEY_PACKAGES.get(pkg_key)
+    if not pkg:
+        await query.edit_message_text("❌ Gói key không hợp lệ.")
+        return
     
     # Kiểm tra số dư
     if user_data[user_id]['balance'] < pkg['price']:
@@ -374,7 +378,7 @@ async def giftcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== NẠP TIỀN =====
+# ===== NẠP TIỀN (ĐÃ SỬA) =====
 async def show_nap_tien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("20.000đ", callback_data="nap_20000")],
@@ -392,7 +396,8 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    amount = int(query.data.split('_')[1])
+    amount_str = query.data.replace("nap_", "")
+    amount = int(amount_str)
     note = f"NAPTIEN{random.randint(10000, 99999)}"
     qr_url = f"https://img.vietqr.io/image/MB-0844551151-compact.png?amount={amount}&addInfo={note}"
     
@@ -442,12 +447,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("active", active_key))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
-    app.add_handler(CallbackQueryHandler(start_game, pattern=r"^game_.*$"))
+    app.add_handler(CallbackQueryHandler(start_game, pattern="^game_betvip$"))
     app.add_handler(CallbackQueryHandler(stop_game, pattern="^stop_game$"))
     app.add_handler(CallbackQueryHandler(back_game, pattern="^back_game$"))
     app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(buy_key, pattern=r"^buykey_.*$"))
-    app.add_handler(CallbackQueryHandler(generate_qr, pattern=r"^nap_\d+$"))
+    app.add_handler(CallbackQueryHandler(buy_key, pattern="^buykey_"))
+    app.add_handler(CallbackQueryHandler(generate_qr, pattern="^nap_"))
     
     print("🤖 Tool Kano AI đang chạy...")
     app.run_polling()
