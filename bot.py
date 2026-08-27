@@ -1,7 +1,6 @@
 import requests
 import logging
 import random
-import asyncio
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
@@ -9,6 +8,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # ===== CẤU HÌNH =====
 TOKEN = "8891039285:AAGuzG0fdsycHSsIhogbth3dvnzE16PTziw"
 API_URL = "https://bettv-predictor.onrender.com/predict"
+GROUP_LINK = "https://t.me/kano_ai2026"
 logging.basicConfig(level=logging.INFO)
 
 # ===== DỮ LIỆU GAME =====
@@ -33,15 +33,24 @@ def get_prediction():
     except Exception as e:
         return None, f"Lỗi kết nối: {e}"
 
-# ===== LỆNH /START =====
+# ===== LỆNH /START (Lời chào + menu) =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     keyboard = [
         [InlineKeyboardButton("🎮 Chơi Game", callback_data="choose_game")],
         [InlineKeyboardButton("💰 Nạp Tiền", callback_data="nap_tien")],
-        [InlineKeyboardButton("📢 Kênh", url="https://t.me/thongbaos1")],
+        [InlineKeyboardButton("👥 Nhóm", url=GROUP_LINK)],
     ]
-    msg = f"🏆 *Tool Kano AI*\nChào {user.first_name}!\nID: `{user.id}`\n\nChọn chức năng bên dưới:"
+    msg = (
+        f"🏆 *Tool Kano AI*\n"
+        f"Xin chào, {user.first_name}!\n"
+        f"ID: `{user.id}`\n\n"
+        f"🤖 *Hệ thống dự đoán Tài Xỉu MD5*\n"
+        f"🔹 Tự động quét phiên 24/7\n"
+        f"🔹 Hỗ trợ nhiều game: Max789, LC79, BetVip, HitClub\n"
+        f"🔹 Độ chính xác cao từ AI Lão làng\n\n"
+        f"📌 *Bấm nút bên dưới để bắt đầu!*"
+    )
     await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 # ===== CHỌN GAME =====
@@ -69,36 +78,32 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game_name = GAMES[game_key]['name']
     user_id = update.effective_user.id
     
-    # Tạo session cho user
+    # Khởi tạo session
     user_sessions[user_id] = {
         "game": game_key,
         "game_name": game_name,
         "active": True,
-        "last_prediction": None,
-        "last_session_id": None
+        "last_session_id": None,
+        "last_result": None
     }
     
     # Gửi giao diện dự đoán lần đầu
     await send_prediction_ui(update, context, user_id, is_first=True)
     
-    # Bắt đầu vòng lặp tự động
-    if not context.job_queue:
-        return
-    
-    # Xóa job cũ nếu có
-    current_jobs = context.job_queue.jobs()
-    for job in current_jobs:
-        if job.name == f"auto_predict_{user_id}":
-            job.schedule_removal()
-    
-    # Tạo job mới (chạy mỗi 5 giây)
-    context.job_queue.run_repeating(
-        auto_predict,
-        interval=5,
-        first=2,
-        name=f"auto_predict_{user_id}",
-        user_id=user_id
-    )
+    # Tạo job tự động (mỗi 5 giây)
+    if context.job_queue:
+        # Xóa job cũ nếu có
+        for job in context.job_queue.jobs():
+            if job.name == f"auto_predict_{user_id}":
+                job.schedule_removal()
+        
+        context.job_queue.run_repeating(
+            auto_predict,
+            interval=5,
+            first=2,
+            name=f"auto_predict_{user_id}",
+            user_id=user_id
+        )
 
 # ===== GỬI GIAO DIỆN DỰ ĐOÁN =====
 async def send_prediction_ui(update, context, user_id, is_first=False):
@@ -108,38 +113,40 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
     
     game_name = session['game_name']
     
-    # Lấy dự đoán
+    # Lấy dự đoán hiện tại
     data, error = get_prediction()
     if error or not data or data.get("status") != "PREDICT":
-        predict_text = "⏳ Đang chờ..."
+        current_session = "---"
+        current_result = "⏳ Đợi..."
         confidence = 0
-        session_id = "---"
     else:
-        predict_text = data.get("predict", "?")
+        current_session = data.get("target_session_id", "---")
+        current_result = data.get("predict", "?")
         confidence = data.get("confidence", 0) * 100
-        session_id = data.get("target_session_id", "---")
-        session['last_prediction'] = predict_text
-        session['last_session_id'] = session_id
+    
+    # Lấy phiên trước (nếu có)
+    prev_session = session.get('last_session_id', '---')
+    prev_result = session.get('last_result', '---')
+    
+    # Cập nhật phiên trước cho lần sau
+    session['last_session_id'] = current_session
+    session['last_result'] = current_result
     
     # Tạo thanh độ tin cậy
     bar_length = 10
     filled = int(confidence / 100 * bar_length)
     bar = "█" * filled + "░" * (bar_length - filled)
     
-    # Thông tin phiên trước
-    prev_session = session.get('last_session_id', '---')
-    prev_result = session.get('last_prediction', '---')
-    
     # Ngày giờ
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     
-    # Giao diện
+    # Giao diện UI
     ui_text = (
         f"🏆 *Tool Kano AI*\n"
         f"🎮 *Game: {game_name}*\n\n"
         f"📊 *DỰ ĐOÁN*\n"
-        f"🔢 Phiên: `{session_id}`\n"
-        f"🎯 Kết quả: *{predict_text}*\n\n"
+        f"🔢 Phiên: `{current_session}`\n"
+        f"🎯 Kết quả: *{current_result}*\n\n"
         f"📈 *ĐỘ TIN CẬY*\n"
         f"`{bar}` {confidence:.1f}%\n\n"
         f"📜 *PHIÊN TRƯỚC*\n"
@@ -160,7 +167,6 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
             parse_mode="Markdown"
         )
     else:
-        # Cập nhật tin nhắn cũ
         try:
             await update.callback_query.message.edit_text(
                 ui_text,
@@ -168,24 +174,16 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
                 parse_mode="Markdown"
             )
         except:
-            # Nếu không edit được, gửi tin nhắn mới
-            await update.callback_query.message.reply_text(
-                ui_text,
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
+            pass
 
 # ===== TỰ ĐỘNG DỰ ĐOÁN =====
 async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
     session = user_sessions.get(user_id)
-    
     if not session or not session.get('active', False):
-        # Hủy job nếu session không hoạt động
         context.job.schedule_removal()
         return
-    
-    # Gửi dự đoán mới
+    # Chỉ gửi cập nhật, không cần update callback_query
     await send_prediction_ui(None, context, user_id, is_first=False)
 
 # ===== DỪNG DỰ ĐOÁN =====
@@ -197,9 +195,7 @@ async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in user_sessions:
         user_sessions[user_id]['active'] = False
     
-    # Xóa job
-    current_jobs = context.job_queue.jobs()
-    for job in current_jobs:
+    for job in context.job_queue.jobs():
         if job.name == f"auto_predict_{user_id}":
             job.schedule_removal()
     
