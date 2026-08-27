@@ -1,84 +1,269 @@
 import requests
 import logging
 import random
+import asyncio
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# Cấu hình
+# ===== CẤU HÌNH =====
 TOKEN = "8891039285:AAGuzG0fdsycHSsIhogbth3dvnzE16PTziw"
 API_URL = "https://bettv-predictor.onrender.com/predict"
 logging.basicConfig(level=logging.INFO)
 
-# Hàm gọi AI
-def get_ai():
-    try:
-        r = requests.get(API_URL, timeout=8)
-        if r.status_code != 200:
-            return "⚠️ AI đang bận"
-        data = r.json()
-        if data.get("status") == "PREDICT":
-            return f"🎯 {data['predict']} (độ tin cậy {data['confidence']*100:.1f}%)"
-        return "⏳ AI đang quan sát"
-    except:
-        return "❌ Mất kết nối AI"
+# ===== DỮ LIỆU GAME =====
+GAMES = {
+    "max789": {"name": "Max789", "icon": "🎰"},
+    "lc79": {"name": "LC79", "icon": "🎲"},
+    "betvip": {"name": "BetVip", "icon": "⭐"},
+    "hitclub": {"name": "HitClub", "icon": "🔥"},
+}
 
-# Lệnh Start
-async def start(update: Update, context):
+# ===== TRẠNG THÁI USER =====
+user_sessions = {}
+
+# ===== HÀM GỌI AI =====
+def get_prediction():
+    try:
+        response = requests.get(API_URL, timeout=10)
+        if response.status_code != 200:
+            return None, f"Lỗi API: {response.status_code}"
+        data = response.json()
+        return data, None
+    except Exception as e:
+        return None, f"Lỗi kết nối: {e}"
+
+# ===== LỆNH /START =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     keyboard = [
-        [InlineKeyboardButton("🎯 Dự Đoán", callback_data="predict")],
-        [InlineKeyboardButton("💰 Nạp Tiền", callback_data="nap")],
+        [InlineKeyboardButton("🎮 Chơi Game", callback_data="choose_game")],
+        [InlineKeyboardButton("💰 Nạp Tiền", callback_data="nap_tien")],
         [InlineKeyboardButton("📢 Kênh", url="https://t.me/thongbaos1")],
     ]
-    msg = f"🏆 *Tool Kano AI*\nChào {user.first_name}!\nID: `{user.id}`\n\nDùng nút bên dưới nhé."
+    msg = f"🏆 *Tool Kano AI*\nChào {user.first_name}!\nID: `{user.id}`\n\nChọn chức năng bên dưới:"
     await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
-# Nút Dự đoán
-async def do_predict(update, context):
-    q = update.callback_query
-    await q.answer()
-    await q.edit_message_text("⏳ Đang gọi AI...")
-    res = get_ai()
-    await q.edit_message_text(res, parse_mode="Markdown")
+# ===== CHỌN GAME =====
+async def choose_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    keyboard = []
+    for key, game in GAMES.items():
+        keyboard.append([InlineKeyboardButton(f"{game['icon']} {game['name']}", callback_data=f"game_{key}")])
+    keyboard.append([InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")])
+    
+    await query.edit_message_text(
+        "🎮 *CHỌN GAME*\n\nChọn game bạn muốn dự đoán:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
-# Nút Nạp tiền
-async def show_nap(update, context):
-    q = update.callback_query
-    await q.answer()
+# ===== BẮT ĐẦU DỰ ĐOÁN =====
+async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    game_key = query.data.split('_')[1]
+    game_name = GAMES[game_key]['name']
+    user_id = update.effective_user.id
+    
+    # Tạo session cho user
+    user_sessions[user_id] = {
+        "game": game_key,
+        "game_name": game_name,
+        "active": True,
+        "last_prediction": None,
+        "last_session_id": None
+    }
+    
+    # Gửi giao diện dự đoán lần đầu
+    await send_prediction_ui(update, context, user_id, is_first=True)
+    
+    # Bắt đầu vòng lặp tự động
+    if not context.job_queue:
+        return
+    
+    # Xóa job cũ nếu có
+    current_jobs = context.job_queue.jobs()
+    for job in current_jobs:
+        if job.name == f"auto_predict_{user_id}":
+            job.schedule_removal()
+    
+    # Tạo job mới (chạy mỗi 5 giây)
+    context.job_queue.run_repeating(
+        auto_predict,
+        interval=5,
+        first=2,
+        name=f"auto_predict_{user_id}",
+        user_id=user_id
+    )
+
+# ===== GỬI GIAO DIỆN DỰ ĐOÁN =====
+async def send_prediction_ui(update, context, user_id, is_first=False):
+    session = user_sessions.get(user_id)
+    if not session:
+        return
+    
+    game_name = session['game_name']
+    
+    # Lấy dự đoán
+    data, error = get_prediction()
+    if error or not data or data.get("status") != "PREDICT":
+        predict_text = "⏳ Đang chờ..."
+        confidence = 0
+        session_id = "---"
+    else:
+        predict_text = data.get("predict", "?")
+        confidence = data.get("confidence", 0) * 100
+        session_id = data.get("target_session_id", "---")
+        session['last_prediction'] = predict_text
+        session['last_session_id'] = session_id
+    
+    # Tạo thanh độ tin cậy
+    bar_length = 10
+    filled = int(confidence / 100 * bar_length)
+    bar = "█" * filled + "░" * (bar_length - filled)
+    
+    # Thông tin phiên trước
+    prev_session = session.get('last_session_id', '---')
+    prev_result = session.get('last_prediction', '---')
+    
+    # Ngày giờ
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    
+    # Giao diện
+    ui_text = (
+        f"🏆 *Tool Kano AI*\n"
+        f"🎮 *Game: {game_name}*\n\n"
+        f"📊 *DỰ ĐOÁN*\n"
+        f"🔢 Phiên: `{session_id}`\n"
+        f"🎯 Kết quả: *{predict_text}*\n\n"
+        f"📈 *ĐỘ TIN CẬY*\n"
+        f"`{bar}` {confidence:.1f}%\n\n"
+        f"📜 *PHIÊN TRƯỚC*\n"
+        f"🔢 Phiên: `{prev_session}`\n"
+        f"🎯 Kết quả: *{prev_result}*\n\n"
+        f"🕒 {now}\n"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("⏹ DỪNG", callback_data="stop_game")],
+        [InlineKeyboardButton("🔙 BACK", callback_data="choose_game")],
+    ]
+    
+    if is_first:
+        await update.callback_query.message.reply_text(
+            ui_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+    else:
+        # Cập nhật tin nhắn cũ
+        try:
+            await update.callback_query.message.edit_text(
+                ui_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+        except:
+            # Nếu không edit được, gửi tin nhắn mới
+            await update.callback_query.message.reply_text(
+                ui_text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="Markdown"
+            )
+
+# ===== TỰ ĐỘNG DỰ ĐOÁN =====
+async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.job.user_id
+    session = user_sessions.get(user_id)
+    
+    if not session or not session.get('active', False):
+        # Hủy job nếu session không hoạt động
+        context.job.schedule_removal()
+        return
+    
+    # Gửi dự đoán mới
+    await send_prediction_ui(None, context, user_id, is_first=False)
+
+# ===== DỪNG DỰ ĐOÁN =====
+async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    if user_id in user_sessions:
+        user_sessions[user_id]['active'] = False
+    
+    # Xóa job
+    current_jobs = context.job_queue.jobs()
+    for job in current_jobs:
+        if job.name == f"auto_predict_{user_id}":
+            job.schedule_removal()
+    
+    await query.edit_message_text(
+        "⏹ *Đã dừng dự đoán.*\n\nBấm /start để quay lại menu chính.",
+        parse_mode="Markdown"
+    )
+
+# ===== QUAY LẠI MENU CHÍNH =====
+async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await start(update, context)
+
+# ===== NẠP TIỀN =====
+async def nap_tien_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
     keyboard = [
         [InlineKeyboardButton("20.000đ", callback_data="nap_20000")],
         [InlineKeyboardButton("50.000đ", callback_data="nap_50000")],
         [InlineKeyboardButton("100.000đ", callback_data="nap_100000")],
-        [InlineKeyboardButton("🔙 Quay lại", callback_data="back")],
+        [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")],
     ]
-    await q.edit_message_text("💰 Chọn số tiền:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(
+        "💰 *CHỌN SỐ TIỀN NẠP*\n\nChọn số tiền để tạo mã QR:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
 
-# Tạo mã QR (có ghi chú ngẫu nhiên)
-async def gen_qr(update, context):
-    q = update.callback_query
-    await q.answer()
-    amount = int(q.data.split('_')[1])
-    note = f"NAPTIEN{random.randint(10000,99999)}"
-    qr = f"https://img.vietqr.io/image/MB-0844551151-compact.png?amount={amount}&addInfo={note}"
-    info = f"💳 MB Bank - PHAM THE HIEN\n🔢 0844551151\n💵 {amount:,}đ\n📝 Ghi chú: `{note}`"
-    await q.message.reply_photo(qr, caption=info, parse_mode="Markdown")
-    await q.edit_message_text("✅ Đã tạo QR, xem bên trên.")
+async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    amount = int(query.data.split('_')[1])
+    note = f"NAPTIEN{random.randint(10000, 99999)}"
+    qr_url = f"https://img.vietqr.io/image/MB-0844551151-compact.png?amount={amount}&addInfo={note}"
+    
+    info = (
+        f"💳 *MB Bank*\n"
+        f"👤 PHAM THE HIEN\n"
+        f"🔢 0844551151\n"
+        f"💵 {amount:,}đ\n"
+        f"📝 Ghi chú: `{note}`\n\n"
+        f"📌 Quét mã QR để chuyển khoản."
+    )
+    
+    await query.message.reply_photo(photo=qr_url, caption=info, parse_mode="Markdown")
+    await query.edit_message_text("✅ Đã tạo mã QR, xem bên trên.")
 
-# Quay lại menu
-async def go_back(update, context):
-    q = update.callback_query
-    await q.answer()
-    await start(update, context)
-
-# Khởi chạy
+# ===== KHỞI ĐỘNG =====
 def main():
     app = Application.builder().token(TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(do_predict, pattern="predict"))
-    app.add_handler(CallbackQueryHandler(show_nap, pattern="nap"))
-    app.add_handler(CallbackQueryHandler(gen_qr, pattern=r"nap_\d+"))
-    app.add_handler(CallbackQueryHandler(go_back, pattern="back"))
-    print("Bot Kano AI đang chạy...")
+    app.add_handler(CallbackQueryHandler(choose_game, pattern="choose_game"))
+    app.add_handler(CallbackQueryHandler(start_game, pattern=r"game_.*"))
+    app.add_handler(CallbackQueryHandler(stop_game, pattern="stop_game"))
+    app.add_handler(CallbackQueryHandler(back_main, pattern="back_main"))
+    app.add_handler(CallbackQueryHandler(nap_tien_menu, pattern="nap_tien"))
+    app.add_handler(CallbackQueryHandler(generate_qr, pattern=r"nap_\d+"))
+    
+    print("🤖 Tool Kano AI đang chạy...")
     app.run_polling()
 
 if __name__ == "__main__":
