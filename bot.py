@@ -70,7 +70,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KEYBOARD)
 
-# ===== XỬ LÝ MENU =====
+# ===== XỬ LÝ MENU (Bắt tất cả tin nhắn văn bản) =====
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "🎮 KHU VỰC GAME":
@@ -89,6 +89,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await contribute(update, context)
     elif text == "📢 KÊNH HỖ TRỢ":
         await support(update, context)
+    else:
+        await update.message.reply_text("⚠️ Vui lòng chọn chức năng từ menu bên dưới.")
 
 # ===== KHU VỰC GAME =====
 async def show_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -276,7 +278,6 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pkg_key = query.data.split('_')[1]
     pkg = KEY_PACKAGES[pkg_key]
     
-    # Tạo key
     new_key = generate_key()
     user_data[user_id]['key'] = new_key
     user_data[user_id]['key_expiry'] = pkg['duration']
@@ -335,7 +336,6 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = f"NAPTIEN{random.randint(10000, 99999)}"
     qr_url = f"https://img.vietqr.io/image/MB-0844551151-compact.png?amount={amount}&addInfo={note}"
     
-    # Cập nhật số dư
     user_data[user_id]['balance'] += amount
     
     info = (
@@ -372,7 +372,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Text(MENU_KEYBOARD), handle_menu))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
     app.add_handler(CallbackQueryHandler(start_game, pattern=r"game_.*"))
     app.add_handler(CallbackQueryHandler(stop_game, pattern="stop_game"))
     app.add_handler(CallbackQueryHandler(back_game, pattern="back_game"))
