@@ -8,7 +8,7 @@ from typing import Optional
 import requests
 import psycopg2
 import redis
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -1065,6 +1065,12 @@ def summary_50():
         })
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+# ===== PHỤC VỤ GIAO DIỆN INDEX.HTML =====
+@app.route('/')
+def serve_index():
+    return send_from_directory('.', 'index.html')
 
 
 # ===== CHẠY AI VÀ TELEGRAM BOT SONG SONG =====
