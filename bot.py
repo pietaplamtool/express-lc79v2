@@ -2,7 +2,7 @@ import requests
 import logging
 import random
 from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # ===== CẤU HÌNH =====
@@ -11,16 +11,25 @@ API_URL = "https://bettv-predictor.onrender.com/predict"
 GROUP_LINK = "https://t.me/kano_ai2026"
 logging.basicConfig(level=logging.INFO)
 
-# ===== TRẠNG THÁI USER =====
+# ===== DỮ LIỆU USER =====
+user_data = {}
 user_sessions = {}
 
-# ===== MENU BÀN PHÍM (Reply Keyboard) =====
+# ===== MENU BÀN PHÍM =====
 MENU_KEYBOARD = ReplyKeyboardMarkup([
     ["🎮 KHU VỰC GAME", "👤 HỒ SƠ"],
     ["🔑 MUA GÓI KEY", "✅ KÍCH HOẠT KEY"],
     ["🎁 NHẬN GIFTCODE", "💰 NẠP TIỀN VÍ"],
     ["📝 GỬI ĐÓNG GÓP", "📢 KÊNH HỖ TRỢ"]
 ], resize_keyboard=True)
+
+# ===== GÓI KEY =====
+KEY_PACKAGES = {
+    "1_ngay": {"name": "1 Ngày", "price": 10000, "duration": "1 ngày"},
+    "7_ngay": {"name": "7 Ngày", "price": 50000, "duration": "7 ngày"},
+    "30_ngay": {"name": "30 Ngày", "price": 150000, "duration": "30 ngày"},
+    "90_ngay": {"name": "90 Ngày", "price": 350000, "duration": "90 ngày"},
+}
 
 # ===== LỜI CHÀO /START =====
 WELCOME_TEXT = (
@@ -44,21 +53,32 @@ def get_prediction():
     except Exception as e:
         return None, f"Lỗi kết nối: {e}"
 
+# ===== TẠO KEY NGẪU NHIÊN =====
+def generate_key():
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    return ''.join(random.choices(chars, k=16))
+
 # ===== LỆNH /START =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in user_data:
+        user_data[user_id] = {
+            "balance": 0,
+            "used": 0,
+            "key": None,
+            "key_expiry": None
+        }
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KEYBOARD)
 
 # ===== XỬ LÝ MENU =====
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    user_id = update.effective_user.id
-
     if text == "🎮 KHU VỰC GAME":
         await show_game_area(update, context)
     elif text == "👤 HỒ SƠ":
         await show_profile(update, context)
     elif text == "🔑 MUA GÓI KEY":
-        await buy_key(update, context)
+        await show_key_packages(update, context)
     elif text == "✅ KÍCH HOẠT KEY":
         await activate_key(update, context)
     elif text == "🎁 NHẬN GIFTCODE":
@@ -77,7 +97,7 @@ async def show_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")]
     ])
     await update.message.reply_text(
-        "🎮 *KHU VỰC GAME*\n\nChọn game bạn muốn dự đoán:",
+        "🎮 *KHU VỰC GAME*\n\nHiện tại chỉ hỗ trợ game BetVip. Các game khác đang phát triển.",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -86,14 +106,11 @@ async def show_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    game_key = query.data.split('_')[1]
-    game_name = "BetVip"  # Hiện chỉ có BetVip
     user_id = update.effective_user.id
     
     user_sessions[user_id] = {
-        "game": game_key,
-        "game_name": game_name,
+        "game": "betvip",
+        "game_name": "BetVip",
         "active": True,
         "last_session_id": None,
         "last_result": None,
@@ -103,7 +120,6 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await send_prediction_ui(update, context, user_id, is_first=True)
     
-    # Tạo job tự động
     if context.job_queue:
         for job in context.job_queue.jobs():
             if job.name == f"auto_predict_{user_id}":
@@ -119,10 +135,8 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== GỬI GIAO DIỆN DỰ ĐOÁN =====
 async def send_prediction_ui(update, context, user_id, is_first=False):
     session = user_sessions.get(user_id)
-    if not session:
+    if not session or not session.get('active', False):
         return
-    
-    game_name = session['game_name']
     
     data, error = get_prediction()
     if error or not data or data.get("status") != "PREDICT":
@@ -147,7 +161,7 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
     
     ui_text = (
         f"🏆 *Tool Kano AI*\n"
-        f"🎮 *Game: {game_name}*\n\n"
+        f"🎮 *Game: BetVip*\n\n"
         f"📊 *DỰ ĐOÁN*\n"
         f"🔢 Phiên: `{current_session}`\n"
         f"🎯 Kết quả: *{current_result}*\n\n"
@@ -205,7 +219,6 @@ async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job.schedule_removal()
     await query.edit_message_text("⏹ *Đã dừng dự đoán.*\n\nBấm /start để quay lại.", parse_mode="Markdown")
 
-# ===== QUAY LẠI =====
 async def back_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -225,42 +238,82 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== HỒ SƠ =====
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    user_id = user.id
+    data = user_data.get(user_id, {"balance": 0, "used": 0})
     await update.message.reply_text(
         f"👤 *HỒ SƠ CỦA BẠN*\n\n"
-        f"ID: `{user.id}`\n"
+        f"ID: `{user_id}`\n"
         f"Tên: {user.first_name}\n"
         f"Username: @{user.username or 'Chưa có'}\n"
-        f"Số dư: 0đ\n"
-        f"KEY VIP: Chưa kích hoạt",
+        f"💰 Số dư hiện có: {data['balance']:,}đ\n"
+        f"💸 Số dư đã sử dụng: {data['used']:,}đ\n"
+        f"🔑 KEY VIP: {data.get('key', 'Chưa có')}\n"
+        f"⏰ Hạn key: {data.get('key_expiry', 'Chưa có')}",
         parse_mode="Markdown"
     )
 
-# ===== CÁC CHỨC NĂNG KHÁC =====
-async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== MUA GÓI KEY =====
+async def show_key_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = []
+    for key, pkg in KEY_PACKAGES.items():
+        keyboard.append([InlineKeyboardButton(
+            f"{pkg['name']} - {pkg['price']:,}đ", 
+            callback_data=f"buykey_{key}"
+        )])
+    keyboard.append([InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")])
+    
     await update.message.reply_text(
-        "🔑 *MUA GÓI KEY VIP*\n\n"
-        "Liên hệ hỗ trợ: @thehpie9\n"
-        "Giá: 30.000đ\n"
-        "Sau khi chuyển khoản, bạn sẽ nhận được key kích hoạt.",
+        "🔑 *MUA GÓI KEY VIP*\n\nChọn gói key phù hợp với bạn:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
 
+async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    pkg_key = query.data.split('_')[1]
+    pkg = KEY_PACKAGES[pkg_key]
+    
+    # Tạo key
+    new_key = generate_key()
+    user_data[user_id]['key'] = new_key
+    user_data[user_id]['key_expiry'] = pkg['duration']
+    
+    await query.message.reply_text(
+        f"💎 *GIAO DỊCH THÀNH CÔNG — CẢM ƠN QUÝ KHÁCH!* 💎\n\n"
+        f"Chân thành cảm ơn bạn đã lựa chọn sử dụng dịch vụ của Tool Kano AI.\n"
+        f"Sự ủng hộ của bạn là động lực lớn nhất để hệ thống tiếp tục nâng cấp và hoàn thiện!\n\n"
+        f"🎁 Key: `{new_key}`\n"
+        f"⏰ Thời Hạn: {pkg['duration']}\n\n"
+        f"🎯 *Lời chúc:*\n"
+        f"Kính chúc bạn sử dụng tool đạt hiệu quả cao nhất, luôn gặp may mắn và gặt hái được thật nhiều thành công! 🌟\n\n"
+        f"👑 *VUI LÒNG ẤN KÍCH HOẠT KEY ĐỂ SỬ DỤNG* 👑",
+        parse_mode="Markdown"
+    )
+    await query.edit_message_text("✅ Đã tạo key thành công! Xem phía trên.")
+
+# ===== KÍCH HOẠT KEY =====
 async def activate_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✅ *KÍCH HOẠT KEY*\n\n"
         "Vui lòng nhập key bạn đã mua theo cú pháp:\n"
-        "`/active KEY_CUA_BAN`",
+        "`/active KEY_CUA_BAN`\n\n"
+        "Ví dụ: `/active ABC123XYZ`",
         parse_mode="Markdown"
     )
 
+# ===== GIFTCODE =====
 async def giftcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎁 *NHẬN GIFTCODE*\n\n"
-        "Hiện tại chưa có giftcode mới.\n"
-        "Theo dõi kênh để nhận thông báo sớm nhất!",
+        "🎁 *Quà Tri Ân Khách Hàng* 🎁\n\n"
+        "Key Free: `CHUA_CO_KEY`\n\n"
+        "Hiện tại chưa có giftcode mới. Theo dõi kênh để nhận thông báo sớm nhất!",
         parse_mode="Markdown"
     )
 
+# ===== NẠP TIỀN =====
 async def show_nap_tien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("20.000đ", callback_data="nap_20000")],
@@ -277,26 +330,32 @@ async def show_nap_tien(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
     amount = int(query.data.split('_')[1])
     note = f"NAPTIEN{random.randint(10000, 99999)}"
     qr_url = f"https://img.vietqr.io/image/MB-0844551151-compact.png?amount={amount}&addInfo={note}"
+    
+    # Cập nhật số dư
+    user_data[user_id]['balance'] += amount
+    
     info = (
         f"💳 *MB Bank*\n"
         f"👤 PHAM THE HIEN\n"
         f"🔢 0844551151\n"
         f"💵 {amount:,}đ\n"
         f"📝 Ghi chú: `{note}`\n\n"
-        f"📌 Quét mã QR để chuyển khoản."
+        f"📌 Quét mã QR để chuyển khoản.\n"
+        f"Sau khi chuyển khoản, số dư sẽ được cập nhật tự động."
     )
     await query.message.reply_photo(photo=qr_url, caption=info, parse_mode="Markdown")
     await query.edit_message_text("✅ Đã tạo mã QR, xem bên trên.")
 
+# ===== CÁC CHỨC NĂNG KHÁC =====
 async def contribute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📝 *GỬI ĐÓNG GÓP*\n\n"
-        "Mọi đóng góp ý kiến vui lòng gửi về:\n"
-        "📩 @thehpie9\n\n"
-        "Chân thành cảm ơn bạn!",
+        "Chức năng đang phát triển.\n"
+        "Mọi đóng góp vui lòng gửi về: @thehpie9",
         parse_mode="Markdown"
     )
 
@@ -318,6 +377,7 @@ def main():
     app.add_handler(CallbackQueryHandler(stop_game, pattern="stop_game"))
     app.add_handler(CallbackQueryHandler(back_game, pattern="back_game"))
     app.add_handler(CallbackQueryHandler(back_main, pattern="back_main"))
+    app.add_handler(CallbackQueryHandler(buy_key, pattern=r"buykey_.*"))
     app.add_handler(CallbackQueryHandler(generate_qr, pattern=r"nap_\d+"))
     
     print("🤖 Tool Kano AI đang chạy...")
