@@ -12,7 +12,7 @@ API_URL = "https://bettv-predictor.onrender.com/predict"
 GROUP_LINK = "https://t.me/kano_ai2026"
 logging.basicConfig(level=logging.INFO)
 
-# ===== DỮ LIỆU USER (Lưu trong RAM) =====
+# ===== DỮ LIỆU USER =====
 user_data = {}
 user_sessions = {}
 
@@ -62,7 +62,6 @@ def get_prediction():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Khởi tạo user data nếu chưa có
     if user_id not in user_data:
         user_data[user_id] = {
             "balance": 0,
@@ -71,7 +70,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "key_expiry": None
         }
     
-    # Đặc biệt: ID 7853432590 có sẵn 2.000.000đ để test
+    # ID 7853432590 có sẵn 2.000.000đ và key test
     if user_id == 7853432590:
         user_data[user_id]["balance"] = 2000000
         user_data[user_id]["key"] = "TEST_KEY_001"
@@ -119,7 +118,6 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = update.effective_user.id
     
-    # Kiểm tra key
     if user_id not in user_data or not user_data[user_id].get('key'):
         await query.edit_message_text(
             "❌ *Bạn chưa có KEY VIP!*\n\n"
@@ -128,7 +126,6 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Khởi tạo session dự đoán
     user_sessions[user_id] = {
         "active": True,
         "last_session_id": None,
@@ -139,12 +136,10 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await send_prediction_ui(update, context, user_id, is_first=True)
     
-    # Xóa job cũ nếu có
     if context.job_queue:
         for job in context.job_queue.jobs():
             if job.name == f"auto_predict_{user_id}":
                 job.schedule_removal()
-        # Tạo job mới chạy mỗi 5 giây
         context.job_queue.run_repeating(
             auto_predict,
             interval=5,
@@ -159,7 +154,6 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
     if not session or not session.get('active'):
         return
     
-    # Gọi AI để lấy dự đoán mới nhất
     data, error = get_prediction()
     if error or not data or data.get("status") != "PREDICT":
         current_session = "---"
@@ -170,15 +164,12 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
         current_result = data.get("predict", "?")
         confidence = data.get("confidence", 0) * 100
     
-    # Lấy phiên trước (nếu có)
     prev_session = session.get('last_session_id', '---')
     prev_result = session.get('last_result', '---')
     
-    # Cập nhật phiên hiện tại cho lần sau
     session['last_session_id'] = current_session
     session['last_result'] = current_result
     
-    # Thanh độ tin cậy
     bar_length = 10
     filled = int(confidence / 100 * bar_length)
     bar = "█" * filled + "░" * (bar_length - filled)
@@ -221,29 +212,15 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
                 parse_mode="Markdown"
             )
         except Exception as e:
-            # Nếu lỗi edit, gửi tin nhắn mới
-            try:
-                new_msg = await context.bot.send_message(
-                    chat_id=session['chat_id'],
-                    text=ui_text,
-                    reply_markup=keyboard,
-                    parse_mode="Markdown"
-                )
-                session['message_id'] = new_msg.message_id
-            except Exception as e2:
-                print(f"Lỗi gửi tin nhắn mới: {e2}")
+            print(f"Lỗi edit: {e}")
 
-# ===== TỰ ĐỘNG DỰ ĐOÁN (CHẠY MỖI 5 GIÂY) =====
+# ===== TỰ ĐỘNG DỰ ĐOÁN =====
 async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
     session = user_sessions.get(user_id)
-    
-    # Nếu session không tồn tại hoặc đã dừng -> xóa job
     if not session or not session.get('active'):
         context.job.schedule_removal()
         return
-    
-    # Gửi dự đoán mới
     await send_prediction_ui(None, context, user_id, is_first=False)
 
 # ===== DỪNG DỰ ĐOÁN =====
@@ -251,29 +228,22 @@ async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    
     if user_id in user_sessions:
         user_sessions[user_id]['active'] = False
-    
-    # Xóa job tự động
     for job in context.job_queue.jobs():
         if job.name == f"auto_predict_{user_id}":
             job.schedule_removal()
-    
     await query.edit_message_text("⏹ *Đã dừng dự đoán.*\n\nBấm /start để quay lại.", parse_mode="Markdown")
 
 async def back_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    
     if user_id in user_sessions:
         user_sessions[user_id]['active'] = False
-    
     for job in context.job_queue.jobs():
         if job.name == f"auto_predict_{user_id}":
             job.schedule_removal()
-    
     await query.edit_message_text("🔙 *Đã quay lại.*\n\nChọn menu bên dưới.", parse_mode="Markdown")
 
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -365,6 +335,36 @@ async def activate_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+# ===== LỆNH /ACTIVE =====
+async def active_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "❌ Vui lòng nhập key cần kích hoạt.\n"
+            "Cú pháp: `/active KEY_CUA_BAN`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    input_key = args[0]
+    if user_id not in user_data or user_data[user_id].get('key') != input_key:
+        await update.message.reply_text(
+            "❌ *Key không hợp lệ!*\n"
+            "Vui lòng kiểm tra lại key hoặc liên hệ hỗ trợ.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    user_data[user_id]['key'] = input_key
+    await update.message.reply_text(
+        "✅ *KÍCH HOẠT KEY THÀNH CÔNG!*\n\n"
+        f"Key: `{input_key}`\n"
+        f"Hạn: {user_data[user_id].get('key_expiry', 'Chưa xác định')}\n\n"
+        "🎯 Chúc bạn may mắn và thành công!",
+        parse_mode="Markdown"
+    )
+
 # ===== GIFTCODE =====
 async def giftcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -397,16 +397,23 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qr_url = f"https://img.vietqr.io/image/MB-0844551151-compact.png?amount={amount}&addInfo={note}"
     
     # Cập nhật số dư
+    old_balance = user_data[user_id]['balance']
     user_data[user_id]['balance'] += amount
+    new_balance = user_data[user_id]['balance']
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     
     info = (
+        f"🔥 *NẠP TIỀN THÀNH CÔNG* 🔥\n\n"
+        f"Tài khoản của bạn `{user_id}` +{amount:,}đ ✅\n"
+        f"💰 Số dư hiện tại: {new_balance:,}đ\n"
+        f"🕒 {now}\n\n"
+        f"---\n"
         f"💳 *MB Bank*\n"
         f"👤 PHAM THE HIEN\n"
         f"🔢 0844551151\n"
         f"💵 {amount:,}đ\n"
         f"📝 Ghi chú: `{note}`\n\n"
-        f"📌 Quét mã QR để chuyển khoản.\n"
-        f"Sau khi chuyển khoản, số dư sẽ được cập nhật tự động."
+        f"📌 Quét mã QR để chuyển khoản."
     )
     await query.message.reply_photo(photo=qr_url, caption=info, parse_mode="Markdown")
     await query.edit_message_text("✅ Đã tạo mã QR, xem bên trên.")
@@ -428,36 +435,6 @@ async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== LỆNH /ACTIVE (Kích hoạt key) =====
-async def active_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "❌ Vui lòng nhập key cần kích hoạt.\n"
-            "Cú pháp: `/active KEY_CUA_BAN`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    input_key = args[0]
-    if user_id not in user_data or user_data[user_id].get('key') != input_key:
-        await update.message.reply_text(
-            "❌ *Key không hợp lệ!*\n"
-            "Vui lòng kiểm tra lại key hoặc liên hệ hỗ trợ.",
-            parse_mode="Markdown"
-        )
-        return
-    
-    user_data[user_id]['key'] = input_key
-    await update.message.reply_text(
-        "✅ *KÍCH HOẠT KEY THÀNH CÔNG!*\n\n"
-        f"Key: `{input_key}`\n"
-        f"Hạn: {user_data[user_id].get('key_expiry', 'Chưa xác định')}\n\n"
-        "🎯 Chúc bạn may mắn và thành công!",
-        parse_mode="Markdown"
-    )
-
 # ===== KHỞI ĐỘNG =====
 def main():
     app = Application.builder().token(TOKEN).build()
@@ -465,12 +442,12 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("active", active_key))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
-    app.add_handler(CallbackQueryHandler(start_game, pattern=r"game_.*"))
-    app.add_handler(CallbackQueryHandler(stop_game, pattern="stop_game"))
-    app.add_handler(CallbackQueryHandler(back_game, pattern="back_game"))
-    app.add_handler(CallbackQueryHandler(back_main, pattern="back_main"))
-    app.add_handler(CallbackQueryHandler(buy_key, pattern=r"buykey_.*"))
-    app.add_handler(CallbackQueryHandler(generate_qr, pattern=r"nap_\d+"))
+    app.add_handler(CallbackQueryHandler(start_game, pattern=r"^game_.*$"))
+    app.add_handler(CallbackQueryHandler(stop_game, pattern="^stop_game$"))
+    app.add_handler(CallbackQueryHandler(back_game, pattern="^back_game$"))
+    app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(buy_key, pattern=r"^buykey_.*$"))
+    app.add_handler(CallbackQueryHandler(generate_qr, pattern=r"^nap_\d+$"))
     
     print("🤖 Tool Kano AI đang chạy...")
     app.run_polling()
