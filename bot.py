@@ -61,6 +61,8 @@ def get_prediction():
 # ===== LỆNH /START =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
+    # Khởi tạo user data nếu chưa có
     if user_id not in user_data:
         user_data[user_id] = {
             "balance": 0,
@@ -68,6 +70,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "key": None,
             "key_expiry": None
         }
+    
+    # Đặc biệt: ID 7853432590 có sẵn 2.000.000đ để test
+    if user_id == 7853432590:
+        user_data[user_id]["balance"] = 2000000
+        user_data[user_id]["key"] = "TEST_KEY_001"
+        user_data[user_id]["key_expiry"] = "30 ngày"
+    
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KEYBOARD)
 
 # ===== XỬ LÝ MENU =====
@@ -119,6 +128,7 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    # Khởi tạo session dự đoán
     user_sessions[user_id] = {
         "active": True,
         "last_session_id": None,
@@ -129,10 +139,12 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await send_prediction_ui(update, context, user_id, is_first=True)
     
+    # Xóa job cũ nếu có
     if context.job_queue:
         for job in context.job_queue.jobs():
             if job.name == f"auto_predict_{user_id}":
                 job.schedule_removal()
+        # Tạo job mới chạy mỗi 5 giây
         context.job_queue.run_repeating(
             auto_predict,
             interval=5,
@@ -147,6 +159,7 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
     if not session or not session.get('active'):
         return
     
+    # Gọi AI để lấy dự đoán mới nhất
     data, error = get_prediction()
     if error or not data or data.get("status") != "PREDICT":
         current_session = "---"
@@ -157,7 +170,7 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
         current_result = data.get("predict", "?")
         confidence = data.get("confidence", 0) * 100
     
-    # Lấy phiên trước từ session
+    # Lấy phiên trước (nếu có)
     prev_session = session.get('last_session_id', '---')
     prev_result = session.get('last_result', '---')
     
@@ -208,15 +221,29 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
                 parse_mode="Markdown"
             )
         except Exception as e:
-            print(f"Lỗi edit: {e}")
+            # Nếu lỗi edit, gửi tin nhắn mới
+            try:
+                new_msg = await context.bot.send_message(
+                    chat_id=session['chat_id'],
+                    text=ui_text,
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+                session['message_id'] = new_msg.message_id
+            except Exception as e2:
+                print(f"Lỗi gửi tin nhắn mới: {e2}")
 
-# ===== TỰ ĐỘNG DỰ ĐOÁN =====
+# ===== TỰ ĐỘNG DỰ ĐOÁN (CHẠY MỖI 5 GIÂY) =====
 async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.user_id
     session = user_sessions.get(user_id)
+    
+    # Nếu session không tồn tại hoặc đã dừng -> xóa job
     if not session or not session.get('active'):
         context.job.schedule_removal()
         return
+    
+    # Gửi dự đoán mới
     await send_prediction_ui(None, context, user_id, is_first=False)
 
 # ===== DỪNG DỰ ĐOÁN =====
@@ -224,22 +251,29 @@ async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    
     if user_id in user_sessions:
         user_sessions[user_id]['active'] = False
+    
+    # Xóa job tự động
     for job in context.job_queue.jobs():
         if job.name == f"auto_predict_{user_id}":
             job.schedule_removal()
+    
     await query.edit_message_text("⏹ *Đã dừng dự đoán.*\n\nBấm /start để quay lại.", parse_mode="Markdown")
 
 async def back_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
+    
     if user_id in user_sessions:
         user_sessions[user_id]['active'] = False
+    
     for job in context.job_queue.jobs():
         if job.name == f"auto_predict_{user_id}":
             job.schedule_removal()
+    
     await query.edit_message_text("🔙 *Đã quay lại.*\n\nChọn menu bên dưới.", parse_mode="Markdown")
 
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
