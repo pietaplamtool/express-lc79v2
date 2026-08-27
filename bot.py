@@ -1,7 +1,6 @@
 import os
 import requests
 import logging
-import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
@@ -11,7 +10,6 @@ API_URL = "https://bettv-predictor.onrender.com/predict"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# ===== HÀM GỌI AI =====
 def get_prediction():
     try:
         response = requests.get(API_URL, timeout=15)
@@ -19,12 +17,9 @@ def get_prediction():
             return None, f"❌ API trả về lỗi: {response.status_code}"
         data = response.json()
         return data, None
-    except requests.exceptions.Timeout:
-        return None, "⏰ AI Render đang ngủ hoặc quá tải, thử lại sau."
     except Exception as e:
         return None, f"❌ Lỗi kết nối: {e}"
 
-# ===== LỆNH /START =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🎯 Dự đoán ngay", callback_data="predict")],
@@ -40,22 +35,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== LỆNH /PREDICT =====
 async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Đang gọi AI Lão làng...")
-
     data, error = get_prediction()
     if error:
         await update.message.reply_text(error)
         return
-
     if data.get("status") == "PREDICT":
         pred = data.get("predict", "?")
         confidence = data.get("confidence", 0) * 100
         reason = data.get("reason", "Không có lý do cụ thể.")
         learned = data.get("learned_rounds", 0)
         state = data.get("supreme_ai", {}).get("state", "Chưa xác định")
-
         msg = (
             f"🎯 *Dự đoán:* `{pred}`\n"
             f"📊 *Độ tin cậy:* `{confidence:.1f}%`\n"
@@ -64,29 +55,24 @@ async def predict(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📝 *Lý do:* {reason[:200]}..."
         )
     else:
-        msg = "⏳ AI đang quan sát và học hỏi. Hãy chờ thêm vài phút hoặc gửi lại lệnh /predict."
-
+        msg = "⏳ AI đang quan sát và học hỏi. Hãy chờ thêm vài phút."
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ===== XỬ LÝ NÚT BẤM =====
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.data == "predict":
         await query.edit_message_text("⏳ Đang gọi AI Lão làng...")
         data, error = get_prediction()
         if error:
             await query.edit_message_text(error)
             return
-
         if data.get("status") == "PREDICT":
             pred = data.get("predict", "?")
             confidence = data.get("confidence", 0) * 100
             reason = data.get("reason", "Không có lý do cụ thể.")
             learned = data.get("learned_rounds", 0)
             state = data.get("supreme_ai", {}).get("state", "Chưa xác định")
-
             msg = (
                 f"🎯 *Dự đoán:* `{pred}`\n"
                 f"📊 *Độ tin cậy:* `{confidence:.1f}%`\n"
@@ -95,10 +81,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📝 *Lý do:* {reason[:200]}..."
             )
         else:
-            msg = "⏳ AI đang quan sát, chưa có dự đoán. Hãy đợi thêm vài ván."
-
+            msg = "⏳ AI đang quan sát, chưa có dự đoán."
         await query.edit_message_text(msg, parse_mode="Markdown")
-
     elif query.data == "stats":
         await query.edit_message_text(
             "📊 *Thông tin AI*\n\n"
@@ -108,15 +92,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-# ===== KHỞI ĐỘNG BOT =====
-async def main():
+def main():
     app_bot = Application.builder().token(TOKEN).build()
     app_bot.add_handler(CommandHandler("start", start))
     app_bot.add_handler(CommandHandler("predict", predict))
     app_bot.add_handler(CallbackQueryHandler(button_handler))
-
     print("🤖 Bot đang chạy và lắng nghe lệnh...")
-    await app_bot.run_polling()
+    app_bot.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
