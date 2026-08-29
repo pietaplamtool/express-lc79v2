@@ -12,7 +12,10 @@ API_URL = "https://bettv-predictor.onrender.com/predict"
 GROUP_LINK = "https://t.me/kano_ai2026"
 logging.basicConfig(level=logging.INFO)
 
-# ===== DỮ LIỆU USER (Lưu trong RAM) =====
+# ===== ADMIN =====
+ADMIN_ID = 7853432590
+
+# ===== DỮ LIỆU USER =====
 user_data = {}
 user_sessions = {}
 
@@ -62,24 +65,24 @@ def get_prediction():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Khởi tạo user data nếu chưa có
     if user_id not in user_data:
         user_data[user_id] = {
             "balance": 0,
             "used": 0,
             "key": None,
-            "key_expiry": None
+            "key_expiry": None,
+            "is_admin": (user_id == ADMIN_ID)
         }
     
-    # ID 7853432590 nhận 2.000.000đ và key test
-    if user_id == 7853432590:
+    # Admin ID 7853432590 nhận 2.000.000đ và key test
+    if user_id == ADMIN_ID:
         user_data[user_id]["balance"] = 2000000
         user_data[user_id]["key"] = "TEST_KEY_001"
         user_data[user_id]["key_expiry"] = "30 ngày"
     
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KEYBOARD)
 
-# ===== XỬ LÝ MENU =====
+# ===== XỬ LÝ MENU (BẮT TẤT CẢ TIN NHẮN VĂN BẢN) =====
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "🎮 KHU VỰC GAME":
@@ -269,7 +272,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== MUA GÓI KEY (ĐÃ SỬA) =====
+# ===== MUA GÓI KEY =====
 async def show_key_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for key, pkg in KEY_PACKAGES.items():
@@ -296,22 +299,27 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Gói key không hợp lệ.")
         return
     
-    # Kiểm tra số dư
-    if user_data[user_id]['balance'] < pkg['price']:
-        await query.message.reply_text(
-            f"❌ *THẤT BẠI* ❌\n\n"
-            f"✉️ Số Dư Của Bạn Không Đủ ✉️\n"
-            f"💰 Số dư hiện tại: {user_data[user_id]['balance']:,}đ\n"
-            f"💸 Cần: {pkg['price']:,}đ\n\n"
-            f"💸 Vui Lòng Nạp Thêm Tiền Để Mua Key 💸",
-            parse_mode="Markdown"
-        )
-        await query.edit_message_text("❌ Giao dịch thất bại do số dư không đủ.")
-        return
+    # Admin mua key vô hạn (không tốn tiền)
+    is_admin = user_data.get(user_id, {}).get("is_admin", False)
     
-    # Trừ tiền và tạo key
-    user_data[user_id]['balance'] -= pkg['price']
-    user_data[user_id]['used'] += pkg['price']
+    if not is_admin:
+        if user_data[user_id]['balance'] < pkg['price']:
+            await query.message.reply_text(
+                f"❌ *THẤT BẠI* ❌\n\n"
+                f"✉️ Số Dư Của Bạn Không Đủ ✉️\n"
+                f"💰 Số dư hiện tại: {user_data[user_id]['balance']:,}đ\n"
+                f"💸 Cần: {pkg['price']:,}đ\n\n"
+                f"💸 Vui Lòng Nạp Thêm Tiền Để Mua Key 💸",
+                parse_mode="Markdown"
+            )
+            await query.edit_message_text("❌ Giao dịch thất bại do số dư không đủ.")
+            return
+        
+        # Trừ tiền
+        user_data[user_id]['balance'] -= pkg['price']
+        user_data[user_id]['used'] += pkg['price']
+    
+    # Tạo key
     new_key = generate_key()
     user_data[user_id]['key'] = new_key
     user_data[user_id]['key_expiry'] = pkg['duration']
@@ -378,7 +386,7 @@ async def giftcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== NẠP TIỀN (ĐÃ SỬA) =====
+# ===== NẠP TIỀN =====
 async def show_nap_tien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("20.000đ", callback_data="nap_20000")],
