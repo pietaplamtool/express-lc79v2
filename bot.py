@@ -12,6 +12,7 @@ API_URL = "https://bettv-predictor.onrender.com/predict"
 GROUP_LINK = "https://t.me/kano_ai2026"
 FEEDBACK_LINK = "https://t.me/feedbackkanoai_2026"
 ADMIN_ID = 7853432590
+ADMIN_USERNAME = "thehpie9"
 logging.basicConfig(level=logging.INFO)
 
 # ===== DỮ LIỆU USER =====
@@ -60,9 +61,20 @@ def get_prediction():
     except Exception as e:
         return None, f"Lỗi kết nối: {e}"
 
+# ===== KIỂM TRA ADMIN =====
+def is_admin(user_id, username=None):
+    if user_id == ADMIN_ID:
+        return True
+    if username and username.lower() == ADMIN_USERNAME.lower():
+        return True
+    return False
+
 # ===== LỆNH /START =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    username = update.effective_user.username or ""
+
+    admin = is_admin(user_id, username)
 
     if user_id not in user_data:
         user_data[user_id] = {
@@ -70,13 +82,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "used": 0,
             "key": None,
             "key_expiry": None,
-            "is_admin": (user_id == ADMIN_ID)
+            "is_admin": admin
         }
+    else:
+        # Cập nhật quyền admin mỗi lần /start
+        user_data[user_id]["is_admin"] = admin
 
-    if user_id == ADMIN_ID:
-        user_data[user_id]["balance"] = 2000000
-        user_data[user_id]["key"] = "TEST_KEY_001"
-        user_data[user_id]["key_expiry"] = "30 ngày"
+    if admin:
+        user_data[user_id]["balance"] = 999999999
+        user_data[user_id]["key"] = "ADMIN_UNLIMITED"
+        user_data[user_id]["key_expiry"] = "Vĩnh viễn"
 
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KEYBOARD)
 
@@ -298,16 +313,24 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
-    data = user_data.get(user_id, {"balance": 0, "used": 0})
+    username = user.username or ""
+    data = user_data.get(user_id, {"balance": 0, "used": 0, "is_admin": False})
+
+    admin = is_admin(user_id, username)
+    role_badge = "👑 *ADMIN — ĐẶC QUYỀN VÔ HẠN*" if admin else "👤 *HỒ SƠ CỦA BẠN*"
+    balance_text = "Không giới hạn" if admin else f"{data['balance']:,}đ"
+    key_text = data.get('key', 'Chưa có')
+    expiry_text = data.get('key_expiry', 'Chưa có')
+
     await update.message.reply_text(
-        f"👤 *HỒ SƠ CỦA BẠN*\n\n"
-        f"ID: `{user_id}`\n"
-        f"Tên: {user.first_name}\n"
-        f"Username: @{user.username or 'Chưa có'}\n"
-        f"💰 Số dư hiện có: {data['balance']:,}đ\n"
-        f"💸 Số dư đã sử dụng: {data['used']:,}đ\n"
-        f"🔑 KEY VIP: {data.get('key', 'Chưa có')}\n"
-        f"⏰ Hạn key: {data.get('key_expiry', 'Chưa có')}",
+        f"{role_badge}\n\n"
+        f"🆔 ID: `{user_id}`\n"
+        f"👤 Tên: {user.first_name}\n"
+        f"🔗 Username: @{username or 'Chưa có'}\n"
+        f"💰 Số dư: {balance_text}\n"
+        f"💸 Đã sử dụng: {data.get('used', 0):,}đ\n"
+        f"🔑 KEY VIP: `{key_text}`\n"
+        f"⏰ Hạn key: {expiry_text}",
         parse_mode="Markdown"
     )
 
@@ -339,9 +362,15 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Gói key không hợp lệ.")
         return
 
-    is_admin = user_data.get(user_id, {}).get("is_admin", False)
+    username = update.effective_user.username or ""
+    admin = is_admin(user_id, username)
 
-    if not is_admin:
+    # Đảm bảo user_data tồn tại
+    if user_id not in user_data:
+        user_data[user_id] = {"balance": 0, "used": 0, "key": None, "key_expiry": None, "is_admin": admin}
+    user_data[user_id]["is_admin"] = admin
+
+    if not admin:
         if user_data[user_id]['balance'] < pkg['price']:
             await query.message.reply_text(
                 f"❌ *THẤT BẠI* ❌\n\n"
@@ -357,15 +386,16 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data[user_id]['balance'] -= pkg['price']
         user_data[user_id]['used'] += pkg['price']
 
-    new_key = generate_key()
+    new_key = "ADMIN_UNLIMITED" if admin else generate_key()
     user_data[user_id]['key'] = new_key
-    user_data[user_id]['key_expiry'] = pkg['duration']
+    user_data[user_id]['key_expiry'] = "Vĩnh viễn" if admin else pkg['duration']
 
+    duration_display = "Vĩnh viễn" if admin else pkg['duration']
     await query.message.reply_text(
         f"💎 *GIAO DỊCH THÀNH CÔNG — CẢM ƠN QUÝ KHÁCH!* 💎\n\n"
         f"Chân thành cảm ơn bạn đã lựa chọn sử dụng dịch vụ của Tool Kano AI.\n\n"
         f"🎁 Key: `{new_key}`\n"
-        f"⏰ Thời Hạn: {pkg['duration']}\n\n"
+        f"⏰ Thời Hạn: {duration_display}\n\n"
         f"🎯 Kính chúc bạn sử dụng tool đạt hiệu quả cao nhất!\n\n"
         f"👑 *VUI LÒNG ẤN KÍCH HOẠT KEY ĐỂ SỬ DỤNG* 👑",
         parse_mode="Markdown"
