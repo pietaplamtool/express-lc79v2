@@ -10,10 +10,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 TOKEN = "8891039285:AAGuzG0fdsycHSsIhogbth3dvnzE16PTziw"
 API_URL = "https://bettv-predictor.onrender.com/predict"
 GROUP_LINK = "https://t.me/kano_ai2026"
-logging.basicConfig(level=logging.INFO)
-
-# ===== ADMIN =====
 ADMIN_ID = 7853432590
+logging.basicConfig(level=logging.INFO)
 
 # ===== DỮ LIỆU USER =====
 user_data = {}
@@ -82,7 +80,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KEYBOARD)
 
-# ===== XỬ LÝ MENU (BẮT TẤT CẢ TIN NHẮN VĂN BẢN) =====
+# ===== XỬ LÝ MENU =====
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text == "🎮 KHU VỰC GAME":
@@ -272,7 +270,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== MUA GÓI KEY =====
+# ===== MUA GÓI KEY (ĐÃ SỬA LỖI) =====
 async def show_key_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for key, pkg in KEY_PACKAGES.items():
@@ -295,14 +293,16 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     pkg_key = query.data.replace("buykey_", "")
     pkg = KEY_PACKAGES.get(pkg_key)
+    
     if not pkg:
         await query.edit_message_text("❌ Gói key không hợp lệ.")
         return
     
-    # Admin mua key vô hạn (không tốn tiền)
+    # Kiểm tra admin
     is_admin = user_data.get(user_id, {}).get("is_admin", False)
     
     if not is_admin:
+        # Kiểm tra số dư
         if user_data[user_id]['balance'] < pkg['price']:
             await query.message.reply_text(
                 f"❌ *THẤT BẠI* ❌\n\n"
@@ -324,6 +324,7 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data[user_id]['key'] = new_key
     user_data[user_id]['key_expiry'] = pkg['duration']
     
+    # Gửi thông báo thành công
     await query.message.reply_text(
         f"💎 *GIAO DỊCH THÀNH CÔNG — CẢM ƠN QUÝ KHÁCH!* 💎\n\n"
         f"Chân thành cảm ơn bạn đã lựa chọn sử dụng dịch vụ của Tool Kano AI.\n"
@@ -335,6 +336,8 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👑 *VUI LÒNG ẤN KÍCH HOẠT KEY ĐỂ SỬ DỤNG* 👑",
         parse_mode="Markdown"
     )
+    
+    # Sửa tin nhắn menu
     await query.edit_message_text("✅ Đã tạo key thành công! Xem phía trên.")
 
 # ===== KÍCH HOẠT KEY =====
@@ -386,7 +389,7 @@ async def giftcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== NẠP TIỀN =====
+# ===== NẠP TIỀN (ĐÃ SỬA LỖI) =====
 async def show_nap_tien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("20.000đ", callback_data="nap_20000")],
@@ -403,9 +406,16 @@ async def show_nap_tien(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
     user_id = update.effective_user.id
     amount_str = query.data.replace("nap_", "")
-    amount = int(amount_str)
+    
+    try:
+        amount = int(amount_str)
+    except:
+        await query.edit_message_text("❌ Số tiền không hợp lệ.")
+        return
+    
     note = f"NAPTIEN{random.randint(10000, 99999)}"
     qr_url = f"https://img.vietqr.io/image/MB-0844551151-compact.png?amount={amount}&addInfo={note}"
     
@@ -428,6 +438,7 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📝 Ghi chú: `{note}`\n\n"
         f"📌 Quét mã QR để chuyển khoản."
     )
+    
     await query.message.reply_photo(photo=qr_url, caption=info, parse_mode="Markdown")
     await query.edit_message_text("✅ Đã tạo mã QR, xem bên trên.")
 
