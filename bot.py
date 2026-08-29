@@ -10,6 +10,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 TOKEN = "8891039285:AAGuzG0fdsycHSsIhogbth3dvnzE16PTziw"
 API_URL = "https://bettv-predictor.onrender.com/predict"
 GROUP_LINK = "https://t.me/kano_ai2026"
+FEEDBACK_LINK = "https://t.me/feedbackkanoai_2026"
 ADMIN_ID = 7853432590
 logging.basicConfig(level=logging.INFO)
 
@@ -22,7 +23,7 @@ MENU_KEYBOARD = ReplyKeyboardMarkup([
     ["🎮 KHU VỰC GAME", "👤 HỒ SƠ"],
     ["🔑 MUA GÓI KEY", "✅ KÍCH HOẠT KEY"],
     ["🎁 NHẬN GIFTCODE", "💰 NẠP TIỀN VÍ"],
-    ["📝 GỬI ĐÓNG GÓP", "📢 KÊNH HỖ TRỢ"]
+    ["📝 FEEDBACK", "📢 KÊNH HỖ TRỢ"]
 ], resize_keyboard=True)
 
 # ===== LỜI CHÀO /START =====
@@ -95,8 +96,8 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await giftcode(update, context)
     elif text == "💰 NẠP TIỀN VÍ":
         await show_nap_tien(update, context)
-    elif text == "📝 GỬI ĐÓNG GÓP":
-        await contribute(update, context)
+    elif text == "📝 FEEDBACK":
+        await feedback(update, context)
     elif text == "📢 KÊNH HỖ TRỢ":
         await support(update, context)
     else:
@@ -133,7 +134,8 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "last_session_id": None,
         "last_result": None,
         "message_id": None,
-        "chat_id": query.message.chat_id
+        "chat_id": query.message.chat_id,
+        "current_session": None
     }
     
     await send_prediction_ui(update, context, user_id, is_first=True)
@@ -166,9 +168,17 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
         current_result = data.get("predict", "?")
         confidence = data.get("confidence", 0) * 100
     
+    # Lấy phiên trước từ session
     prev_session = session.get('last_session_id', '---')
     prev_result = session.get('last_result', '---')
     
+    # Nếu phiên hiện tại khác phiên trước và phiên trước không phải None -> có kết quả mới
+    new_result = False
+    if session.get('current_session') is not None and session['current_session'] != current_session:
+        new_result = True
+    
+    # Cập nhật phiên hiện tại
+    session['current_session'] = current_session
     session['last_session_id'] = current_session
     session['last_result'] = current_result
     
@@ -204,17 +214,32 @@ async def send_prediction_ui(update, context, user_id, is_first=False):
         )
         session['message_id'] = msg.message_id
         session['chat_id'] = msg.chat_id
+        session['current_session'] = current_session
+        session['last_session_id'] = current_session
+        session['last_result'] = current_result
     else:
-        try:
-            await context.bot.edit_message_text(
-                ui_text,
+        # Nếu có kết quả mới, gửi tin nhắn mới thay vì edit
+        if new_result and current_session != "---":
+            await context.bot.send_message(
                 chat_id=session['chat_id'],
-                message_id=session['message_id'],
+                text=ui_text,
                 reply_markup=keyboard,
                 parse_mode="Markdown"
             )
-        except Exception as e:
-            print(f"Lỗi edit: {e}")
+            # Cập nhật message_id để edit lần sau
+            # Lấy tin nhắn cuối cùng
+            # Không cần cập nhật message_id vì sẽ edit tin nhắn cũ cho lần tiếp theo
+        else:
+            try:
+                await context.bot.edit_message_text(
+                    ui_text,
+                    chat_id=session['chat_id'],
+                    message_id=session['message_id'],
+                    reply_markup=keyboard,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                print(f"Lỗi edit: {e}")
 
 # ===== TỰ ĐỘNG DỰ ĐOÁN =====
 async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
@@ -270,7 +295,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== MUA GÓI KEY (ĐÃ SỬA LỖI) =====
+# ===== MUA GÓI KEY =====
 async def show_key_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for key, pkg in KEY_PACKAGES.items():
@@ -324,7 +349,6 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data[user_id]['key'] = new_key
     user_data[user_id]['key_expiry'] = pkg['duration']
     
-    # Gửi thông báo thành công
     await query.message.reply_text(
         f"💎 *GIAO DỊCH THÀNH CÔNG — CẢM ƠN QUÝ KHÁCH!* 💎\n\n"
         f"Chân thành cảm ơn bạn đã lựa chọn sử dụng dịch vụ của Tool Kano AI.\n"
@@ -336,8 +360,6 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👑 *VUI LÒNG ẤN KÍCH HOẠT KEY ĐỂ SỬ DỤNG* 👑",
         parse_mode="Markdown"
     )
-    
-    # Sửa tin nhắn menu
     await query.edit_message_text("✅ Đã tạo key thành công! Xem phía trên.")
 
 # ===== KÍCH HOẠT KEY =====
@@ -389,7 +411,7 @@ async def giftcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== NẠP TIỀN (ĐÃ SỬA LỖI) =====
+# ===== NẠP TIỀN (ĐÃ SỬA) =====
 async def show_nap_tien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("20.000đ", callback_data="nap_20000")],
@@ -416,11 +438,11 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Số tiền không hợp lệ.")
         return
     
+    # Tạo ghi chú ngẫu nhiên
     note = f"NAPTIEN{random.randint(10000, 99999)}"
     qr_url = f"https://img.vietqr.io/image/MB-0844551151-compact.png?amount={amount}&addInfo={note}"
     
     # Cập nhật số dư
-    old_balance = user_data[user_id]['balance']
     user_data[user_id]['balance'] += amount
     new_balance = user_data[user_id]['balance']
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
@@ -431,26 +453,29 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 Số dư hiện tại: {new_balance:,}đ\n"
         f"🕒 {now}\n\n"
         f"---\n"
-        f"💳 *MB Bank*\n"
-        f"👤 PHAM THE HIEN\n"
-        f"🔢 0844551151\n"
-        f"💵 {amount:,}đ\n"
-        f"📝 Ghi chú: `{note}`\n\n"
+        f"🏦 *Ngân hàng:* MBBANK\n"
+        f"👤 *Họ tên:* PHAM THE HIEN\n"
+        f"🔢 *STK:* 0844551151\n"
+        f"📝 *Ghi chú:* `{note}`\n\n"
         f"📌 Quét mã QR để chuyển khoản."
     )
     
     await query.message.reply_photo(photo=qr_url, caption=info, parse_mode="Markdown")
     await query.edit_message_text("✅ Đã tạo mã QR, xem bên trên.")
 
-# ===== CÁC CHỨC NĂNG KHÁC =====
-async def contribute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== FEEDBACK =====
+async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Gửi Feedback", url=FEEDBACK_LINK)]
+    ])
     await update.message.reply_text(
-        "📝 *GỬI ĐÓNG GÓP*\n\n"
-        "Chức năng đang phát triển.\n"
-        "Mọi đóng góp vui lòng gửi về: @thehpie9",
+        "📝 *FEEDBACK*\n\n"
+        "Mọi ý kiến đóng góp vui lòng gửi qua kênh bên dưới.",
+        reply_markup=keyboard,
         parse_mode="Markdown"
     )
 
+# ===== KÊNH HỖ TRỢ =====
 async def support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📢 *KÊNH HỖ TRỢ*\n\n"
