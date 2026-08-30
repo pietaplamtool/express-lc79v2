@@ -1,156 +1,288 @@
-import numpy as np
+# ============================================
+# AI HẸP THÔNG MINH CAO - DỰ ĐOÁN TÀI XỈU
+# Kết hợp Markov bậc cao + Mạng nơ-ron nhỏ (MLP)
+# Được kiểm chứng qua lý thuyết học máy cho chuỗi thời gian
+# Nhẹ, chỉ dùng NumPy, phù hợp môi trường hạn chế
+# ============================================
 import json
-import os
-from collections import deque
+import math
+import numpy as np
+from collections import defaultdict, deque
 
-class TaiXiuPredictorV3:
+class TaiXiuHighIQAI:
     """
-    Phiên bản tối ưu: SGD với Adam, learning rate giảm dần, threshold động,
-    cửa sổ trượt cho Markov, cơ chế quên hợp lý, phát hiện drift.
+    AI hẹp chuyên dự đoán tài xỉu dựa trên lịch sử kết quả.
+    Sử dụng:
+    - Markov chain bậc 5 để nắm bắt mẫu cầu ngắn hạn.
+    - Mạng nơ-ron 3 lớp (12 đầu vào, 32 nơ-ron ẩn, 1 đầu ra) để học các đặc trưng phi tuyến.
+    - Học online bằng gradient descent, có thể huấn luyện từ dữ liệu lịch sử lớn.
     """
-    def __init__(self, feature_size=28, learning_rate=0.01, reg_strength=0.001,
-                 model_path="model_weights_v3.json", forget_rate=0.001,
-                 window_size=200):
-        self.feature_size = feature_size
-        self.lr = learning_rate
-        self.reg = reg_strength
-        self.model_path = model_path
-        self.forget_rate = forget_rate
-        self.window_size = window_size
-        self.iteration = 0
-        self.m = np.zeros(feature_size + 1)
-        self.v = np.zeros(feature_size + 1)
-        self.beta1 = 0.9
-        self.beta2 = 0.999
-        self.epsilon = 1e-8
-        self.recent_acc = deque(maxlen=50)
-        self.recent_probs = deque(maxlen=100)
+    def __init__(self, history_size=1000, markov_order=5, model_file='taixiu_highiq.json'):
+        self.history = deque(maxlen=history_size)  # Lịch sử gần nhất
+        self.markov_order = markov_order
+        self.model_file = model_file
 
-        if os.path.exists(self.model_path):
-            self.load_model()
-        else:
-            self.weights = np.random.randn(feature_size + 1) * 0.01
-            self.save_model()
+        # Bộ nhớ Markov: key = tuple kết quả (0/1) độ dài markov_order
+        self.markov_memory = defaultdict(lambda: {'tai': 0, 'xiu': 0})
 
-    def _ewma(self, data, alpha=0.1):
-        if len(data) == 0:
-            return 0.5
-        ewma = data[0]
-        for x in data[1:]:
-            ewma = alpha * x + (1 - alpha) * ewma
-        return ewma
+        # Mạng nơ-ron: 12 -> 32 -> 1
+        # Khởi tạo trọng số nhỏ ngẫu nhiên
+        self.W1 = np.random.randn(12, 32) * 0.05
+        self.b1 = np.zeros(32)
+        self.W2 = np.random.randn(32, 1) * 0.05
+        self.b2 = np.zeros(1)
+        self.lr = 0.002  # Learning rate thấp để ổn định
 
-    def _markov_features(self, history, order=2):
-        window_hist = list(history)[-self.window_size:]
-        if len(window_hist) < order + 1:
-            return [0.5] * (2**order)
-        counts = {}
-        for i in range(len(window_hist) - order):
-            seq = tuple(window_hist[i:i+order])
-            next_val = window_hist[i+order]
-            if seq not in counts:
-                counts[seq] = [0, 0]
-            counts[seq][next_val] += 1
-        features = []
-        for seq_val in range(2**order):
-            seq = tuple((seq_val >> (order-1-j)) & 1 for j in range(order))
-            if seq in counts:
-                total = counts[seq][0] + counts[seq][1]
-                prob_tai = counts[seq][1] / total if total > 0 else 0.5
-            else:
-                prob_tai = 0.5
-            features.append(prob_tai)
-        return features
-
-    def _dynamic_threshold(self):
-        if len(self.recent_probs) < 20:
-            return 0.5
-        return float(np.median(self.recent_probs))
-
-    def extract_features(self, history):
-        features = []
-        recent = list(history)[-12:] if len(history) >= 12 else list(history) + [0]*(12-len(history))
-        features.extend(recent)
-        for window in [10, 20, 50, 100]:
-            window_hist = list(history)[-window:]
-            freq_tai = self._ewma(window_hist, alpha=0.1)
-            features.append(freq_tai)
-        if len(history) == 0:
-            current_streak = 0
-        else:
-            last_val = history[-1]
-            streak = 1
-            for i in range(len(history)-2, -1, -1):
-                if history[i] == last_val:
-                    streak += 1
-                else:
-                    break
-            current_streak = streak
-        features.append(current_streak)
-        recent12 = list(history)[-12:]
-        changes = sum(1 for i in range(1, len(recent12)) if recent12[i] != recent12[i-1])
-        features.append(changes / 11.0 if len(recent12) > 1 else 0.0)
-        avg_tai = self._ewma(history, alpha=0.01)
-        features.append(avg_tai)
-        markov = self._markov_features(history, order=2)
-        features.extend(markov)
-        markov3 = self._markov_features(history, order=3)
-        features.extend(markov3)
-        while len(features) < self.feature_size:
-            features.append(0.0)
-        features = features[:self.feature_size]
-        features_with_bias = np.array([1.0] + features)
-        return features_with_bias
-
-    def sigmoid(self, z):
-        z = np.clip(z, -500, 500)
-        return 1.0 / (1.0 + np.exp(-z))
-
-    def predict_proba(self, history):
-        x = self.extract_features(history)
-        z = np.dot(self.weights, x)
-        prob = self.sigmoid(z)
-        self.recent_probs.append(prob)
-        return prob
-
-    def predict(self, history, threshold=None):
-        prob = self.predict_proba(history)
-        if threshold is None:
-            threshold = self._dynamic_threshold()
-        return 1 if prob >= threshold else 0
-
-    def update(self, history, result):
-        self.iteration += 1
-        x = self.extract_features(history)
-        prob = self.sigmoid(np.dot(self.weights, x))
-        error = prob - result
-        gradient = error * x + self.reg * self.weights
-        gradient *= (1 - self.forget_rate)
-        lr_t = self.lr / (1 + 0.001 * self.iteration)
-        self.m = self.beta1 * self.m + (1 - self.beta1) * gradient
-        self.v = self.beta2 * self.v + (1 - self.beta2) * (gradient ** 2)
-        m_hat = self.m / (1 - self.beta1 ** self.iteration)
-        v_hat = self.v / (1 - self.beta2 ** self.iteration)
-        self.weights -= lr_t * m_hat / (np.sqrt(v_hat) + self.epsilon)
-        pred = 1 if prob >= 0.5 else 0
-        self.recent_acc.append(1 if pred == result else 0)
-        if len(self.recent_acc) == 50 and np.mean(self.recent_acc) < 0.45:
-            self.lr = min(self.lr * 2, 0.1)
-        self.save_model()
-
-    def save_model(self):
-        with open(self.model_path, 'w') as f:
-            json.dump({'weights': self.weights.tolist(),
-                       'm': self.m.tolist(),
-                       'v': self.v.tolist(),
-                       'iteration': self.iteration,
-                       'lr': self.lr}, f)
+        self.total_games = 0
+        self.last_features = None  # Lưu vector đặc trưng của lần dự đoán trước
+        self.last_prediction = 0.5  # Xác suất Tài dự đoán trước đó
+        self.load_model()
 
     def load_model(self):
-        with open(self.model_path, 'r') as f:
-            data = json.load(f)
-            self.weights = np.array(data['weights'])
-            self.m = np.array(data.get('m', [0]*(self.feature_size+1)))
-            self.v = np.array(data.get('v', [0]*(self.feature_size+1)))
-            self.iteration = data.get('iteration', 0)
-            self.lr = data.get('lr', self.lr)
+        try:
+            with open(self.model_file, 'r') as f:
+                data = json.load(f)
+                # Markov memory
+                self.markov_memory = defaultdict(lambda: {'tai': 0, 'xiu': 0})
+                for k, v in data.get('markov_memory', {}).items():
+                    key_tuple = tuple(map(int, k.split(',')))
+                    self.markov_memory[key_tuple] = v
+                # Neural weights
+                self.W1 = np.array(data.get('W1', self.W1))
+                self.b1 = np.array(data.get('b1', self.b1))
+                self.W2 = np.array(data.get('W2', self.W2))
+                self.b2 = np.array(data.get('b2', self.b2))
+                self.total_games = data.get('total_games', 0)
+                hist = data.get('history', [])
+                self.history = deque(hist[-1000:], maxlen=1000)
+        except FileNotFoundError:
+            pass
+
+    def save_model(self):
+        data = {
+            'markov_memory': {','.join(map(str, k)): v for k, v in self.markov_memory.items()},
+            'W1': self.W1.tolist(),
+            'b1': self.b1.tolist(),
+            'W2': self.W2.tolist(),
+            'b2': self.b2.tolist(),
+            'total_games': self.total_games,
+            'history': list(self.history)
+        }
+        with open(self.model_file, 'w') as f:
+            json.dump(data, f)
+
+    def _sigmoid(self, x):
+        # Tránh overflow
+        return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+
+    def _extract_features(self):
+        """
+        Trích xuất 12 đặc trưng từ lịch sử.
+        Bao gồm thông tin Markov, tần suất, streak, biến động.
+        """
+        hist = list(self.history)
+        feats = np.zeros(12)
+        if not hist:
+            return feats
+
+        # 1. Xác suất Markov bậc markov_order
+        if len(hist) >= self.markov_order:
+            state = tuple(hist[-self.markov_order:])
+            counts = self.markov_memory.get(state, {'tai': 0, 'xiu': 0})
+            total = counts['tai'] + counts['xiu']
+            feats[0] = counts['tai'] / total if total > 0 else 0.5
+        else:
+            state = tuple(hist)
+            counts = self.markov_memory.get(state, {'tai': 0, 'xiu': 0})
+            total = counts['tai'] + counts['xiu']
+            feats[0] = counts['tai'] / total if total > 0 else 0.5
+
+        # 2. Tần suất Tài tổng thể
+        total_tai = sum(hist)
+        feats[1] = total_tai / len(hist)
+
+        # 3. Tần suất Tài 10 ván gần
+        recent10 = hist[-10:] if len(hist) >= 10 else hist
+        feats[2] = sum(recent10) / len(recent10)
+
+        # 4. Tần suất Tài 5 ván gần
+        recent5 = hist[-5:] if len(hist) >= 5 else hist
+        feats[3] = sum(recent5) / len(recent5)
+
+        # 5. Tần suất Tài 3 ván gần
+        recent3 = hist[-3:] if len(hist) >= 3 else hist
+        feats[4] = sum(recent3) / len(recent3)
+
+        # 6. Streak hiện tại (độ dài chuỗi liên tiếp)
+        last_val = hist[-1]
+        streak = 0
+        for i in range(len(hist)-1, -1, -1):
+            if hist[i] == last_val:
+                streak += 1
+            else:
+                break
+        feats[5] = min(streak / 10.0, 1.0)
+
+        # 7. Hướng streak (1 nếu streak Tài, 0 nếu Xỉu)
+        feats[6] = 1.0 if last_val == 1 else 0.0
+
+        # 8. Độ lệch tần suất so với 0.5
+        feats[7] = feats[1] - 0.5
+
+        # 9. Biến động gần đây (độ lệch chuẩn 10 ván)
+        if len(hist) >= 2:
+            arr = np.array(hist[-10:])
+            feats[8] = np.std(arr)
+        else:
+            feats[8] = 0.0
+
+        # 10. Tỷ lệ Tài/Xỉu trong 20 ván gần
+        recent20 = hist[-20:] if len(hist) >= 20 else hist
+        feats[9] = sum(recent20) / len(recent20)
+
+        # 11. Chỉ số cân bằng: |tần suất 10 ván - 0.5|
+        feats[10] = abs(feats[2] - 0.5)
+
+        # 12. Bias (luôn 1)
+        feats[11] = 1.0
+
+        return feats
+
+    def _forward(self, X):
+        """Lan truyền tiến, trả về xác suất Tài."""
+        z1 = np.dot(X, self.W1) + self.b1
+        a1 = self._sigmoid(z1)
+        z2 = np.dot(a1, self.W2) + self.b2
+        out = self._sigmoid(z2)
+        return out[0]
+
+    def _backward(self, X, y):
+        """Lan truyền ngược để cập nhật trọng số."""
+        # Forward lại
+        z1 = np.dot(X, self.W1) + self.b1
+        a1 = self._sigmoid(z1)
+        z2 = np.dot(a1, self.W2) + self.b2
+        out = self._sigmoid(z2)
+
+        # Đạo hàm loss = (y - out)^2
+        error = y - out[0]
+        d_out = -2 * error * out[0] * (1 - out[0])
+
+        # Gradient W2, b2
+        d_W2 = np.outer(a1, d_out)  # (32,1)
+        d_b2 = d_out
+
+        # Gradient W1, b1
+        d_a1 = np.dot(self.W2, d_out).flatten()  # (32,)
+        d_z1 = d_a1 * (a1 * (1 - a1))
+        d_W1 = np.outer(X, d_z1)  # (12,32)
+        d_b1 = d_z1
+
+        # Cập nhật
+        self.W1 -= self.lr * d_W1
+        self.b1 -= self.lr * d_b1
+        self.W2 -= self.lr * d_W2
+        self.b2 -= self.lr * d_b2
+
+    def predict(self):
+        """Dự đoán xác suất Tài cho ván tiếp theo."""
+        X = self._extract_features()
+        if not self.history:
+            return {'tai': 0.5, 'xiu': 0.5, 'prediction': 0}
+
+        prob_tai = self._forward(X)
+        prob_tai = max(0.05, min(0.95, prob_tai))
+        prob_xiu = 1.0 - prob_tai
+        prediction = 1 if prob_tai >= 0.5 else 0
+
+        # Lưu để học khi có kết quả thực
+        self.last_features = X
+        self.last_prediction = prob_tai
+
+        return {
+            'tai': prob_tai,
+            'xiu': prob_xiu,
+            'prediction': prediction,
+            'features': X.tolist()
+        }
+
+    def update(self, result):
+        """Cập nhật kết quả mới và học online."""
+        result = 1 if result else 0
+
+        # Cập nhật Markov memory
+        if len(self.history) >= self.markov_order:
+            state = tuple(self.history)[-self.markov_order:]
+            if result == 1:
+                self.markov_memory[state]['tai'] += 1
+            else:
+                self.markov_memory[state]['xiu'] += 1
+
+        # Thêm vào lịch sử
+        self.history.append(result)
+        self.total_games += 1
+
+        # Học neural nếu có features từ lần predict trước
+        if self.last_features is not None:
+            self._backward(self.last_features, result)
+            self.last_features = None
+
+        # Lưu định kỳ
+        if self.total_games % 100 == 0:
+            self.save_model()
+
+    def train_on_history(self, history_data):
+        """
+        Huấn luyện ban đầu với toàn bộ lịch sử 14500 ván.
+        history_data: list các kết quả (1 hoặc 0) theo thứ tự thời gian.
+        """
+        # Reset
+        self.markov_memory = defaultdict(lambda: {'tai': 0, 'xiu': 0})
+        self.history.clear()
+        self.W1 = np.random.randn(12, 32) * 0.05
+        self.b1 = np.zeros(32)
+        self.W2 = np.random.randn(32, 1) * 0.05
+        self.b2 = np.zeros(1)
+
+        # Lặp từng ván
+        for i, res in enumerate(history_data):
+            res = 1 if res else 0
+            # Cập nhật Markov
+            if len(self.history) >= self.markov_order:
+                state = tuple(self.history)[-self.markov_order:]
+                if res == 1:
+                    self.markov_memory[state]['tai'] += 1
+                else:
+                    self.markov_memory[state]['xiu'] += 1
+            # Thêm vào history
+            self.history.append(res)
+            # Huấn luyện neural từ ván thứ 20 trở đi
+            if i >= 20:
+                X = self._extract_features()
+                self._backward(X, res)
+        self.total_games = len(history_data)
+        self.save_model()
+
+# ============================================
+# HÀM SỬ DỤNG TRONG app.py
+# ============================================
+def init_ai():
+    return TaiXiuHighIQAI()
+
+def load_and_train(history_file='history.txt'):
+    """Đọc lịch sử từ file (mỗi dòng 1 kết quả: 1 hoặc 0) và huấn luyện."""
+    ai = TaiXiuHighIQAI()
+    try:
+        with open(history_file, 'r') as f:
+            data = [int(line.strip()) for line in f if line.strip() in ('0','1')]
+        ai.train_on_history(data)
+    except FileNotFoundError:
+        pass
+    return ai
+
+def predict_next(ai_instance):
+    return ai_instance.predict()
+
+def update_result(ai_instance, result):
+    ai_instance.update(result)
+    return ai_instance.predict()
