@@ -15,16 +15,16 @@ class TaiXiuPredictorV3:
         self.lr = learning_rate
         self.reg = reg_strength
         self.model_path = model_path
-        self.forget_rate = forget_rate  # hệ số quên mỗi lần cập nhật
-        self.window_size = window_size  # cửa sổ trượt cho Markov
+        self.forget_rate = forget_rate
+        self.window_size = window_size
         self.iteration = 0
         self.m = np.zeros(feature_size + 1)
         self.v = np.zeros(feature_size + 1)
         self.beta1 = 0.9
         self.beta2 = 0.999
         self.epsilon = 1e-8
-        self.recent_acc = deque(maxlen=50)  # lưu độ chính xác gần đây
-        self.recent_probs = deque(maxlen=100)  # lưu xác suất dự đoán gần đây
+        self.recent_acc = deque(maxlen=50)
+        self.recent_probs = deque(maxlen=100)
 
         if os.path.exists(self.model_path):
             self.load_model()
@@ -33,7 +33,6 @@ class TaiXiuPredictorV3:
             self.save_model()
 
     def _ewma(self, data, alpha=0.1):
-        """Trung bình trượt có trọng số giảm dần."""
         if len(data) == 0:
             return 0.5
         ewma = data[0]
@@ -42,7 +41,6 @@ class TaiXiuPredictorV3:
         return ewma
 
     def _markov_features(self, history, order=2):
-        """Tính xác suất chuyển trạng thái Markov trên cửa sổ trượt gần nhất."""
         window_hist = list(history)[-self.window_size:]
         if len(window_hist) < order + 1:
             return [0.5] * (2**order)
@@ -65,22 +63,18 @@ class TaiXiuPredictorV3:
         return features
 
     def _dynamic_threshold(self):
-        """Ngưỡng động dựa trên median của xác suất dự đoán gần đây."""
         if len(self.recent_probs) < 20:
             return 0.5
         return float(np.median(self.recent_probs))
 
     def extract_features(self, history):
         features = []
-        # 12 kết quả gần nhất (tăng từ 10 lên 12 để nhiều thông tin)
         recent = list(history)[-12:] if len(history) >= 12 else list(history) + [0]*(12-len(history))
         features.extend(recent)
-        # Tần suất Tài với EWMA trên các cửa sổ khác nhau
         for window in [10, 20, 50, 100]:
             window_hist = list(history)[-window:]
             freq_tai = self._ewma(window_hist, alpha=0.1)
             features.append(freq_tai)
-        # Độ dài cầu hiện tại
         if len(history) == 0:
             current_streak = 0
         else:
@@ -93,20 +87,15 @@ class TaiXiuPredictorV3:
                     break
             current_streak = streak
         features.append(current_streak)
-        # Số lần đổi kết quả trong 12 ván gần
         recent12 = list(history)[-12:]
         changes = sum(1 for i in range(1, len(recent12)) if recent12[i] != recent12[i-1])
         features.append(changes / 11.0 if len(recent12) > 1 else 0.0)
-        # Trung bình toàn bộ (EWMA)
         avg_tai = self._ewma(history, alpha=0.01)
         features.append(avg_tai)
-        # Markov bậc 2 (4 đặc trưng)
         markov = self._markov_features(history, order=2)
         features.extend(markov)
-        # Markov bậc 3 (8 đặc trưng) - thêm chi tiết
         markov3 = self._markov_features(history, order=3)
         features.extend(markov3)
-        # Đảm bảo đủ feature_size
         while len(features) < self.feature_size:
             features.append(0.0)
         features = features[:self.feature_size]
@@ -121,7 +110,6 @@ class TaiXiuPredictorV3:
         x = self.extract_features(history)
         z = np.dot(self.weights, x)
         prob = self.sigmoid(z)
-        # Lưu xác suất vào deque để tính threshold động
         self.recent_probs.append(prob)
         return prob
 
@@ -137,24 +125,17 @@ class TaiXiuPredictorV3:
         prob = self.sigmoid(np.dot(self.weights, x))
         error = prob - result
         gradient = error * x + self.reg * self.weights
-        # Áp dụng hệ số quên: giảm dần ảnh hưởng của gradient cũ
-        # Sử dụng forget_rate cố định, không lũy thừa theo iteration
         gradient *= (1 - self.forget_rate)
-        # Learning rate giảm dần theo iteration
         lr_t = self.lr / (1 + 0.001 * self.iteration)
-        # Adam optimizer
         self.m = self.beta1 * self.m + (1 - self.beta1) * gradient
         self.v = self.beta2 * self.v + (1 - self.beta2) * (gradient ** 2)
         m_hat = self.m / (1 - self.beta1 ** self.iteration)
         v_hat = self.v / (1 - self.beta2 ** self.iteration)
         self.weights -= lr_t * m_hat / (np.sqrt(v_hat) + self.epsilon)
-        # Cập nhật độ chính xác gần đây
         pred = 1 if prob >= 0.5 else 0
         self.recent_acc.append(1 if pred == result else 0)
-        # Phát hiện drift: nếu accuracy 50 ván < 45% thì tăng learning rate tạm thời
         if len(self.recent_acc) == 50 and np.mean(self.recent_acc) < 0.45:
-            self.lr = min(self.lr * 2, 0.1)  # tăng tối đa 0.1
-        # Lưu model mỗi ván (có thể giảm tần suất nếu cần)
+            self.lr = min(self.lr * 2, 0.1)
         self.save_model()
 
     def save_model(self):
@@ -173,13 +154,3 @@ class TaiXiuPredictorV3:
             self.v = np.array(data.get('v', [0]*(self.feature_size+1)))
             self.iteration = data.get('iteration', 0)
             self.lr = data.get('lr', self.lr)
-
-# Hướng dẫn sử dụng
-predictor = TaiXiuPredictorV3()
-history = [1,0,1,1,0,0,1,0,1,1,0,1,0,0,1,1,0,1,0,0]  # cập nhật liên tục
-pred = predictor.predict(history)
-print("Dự đoán:", "Tài" if pred == 1 else "Xỉu")
-# Sau khi có kết quả thực tế:
-actual_result = 1
-predictor.update(history, actual_result)
-history.append(actual_result)
