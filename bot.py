@@ -103,12 +103,11 @@ def ensure_user(uid, username=""):
 def fetch_predict():
     """
     Gọi API predict.
-    Trả về dict với confidence_pct đã chuẩn hoá về %, hoặc None nếu lỗi.
-    Mốc quan trọng: data["latest_session_id"] — ID phiên vừa có kết quả thật.
-    Khi latest_session_id tăng => phiên mới bắt đầu => cần gửi dự đoán ngay.
+    Trả về dict hoặc None.
+    Nếu status=TRAINING thì trả về nhưng caller phải bỏ qua logic phiên mới.
     """
     try:
-        r = requests.get(PREDICT_URL, timeout=10)
+        r = requests.get(PREDICT_URL, timeout=12)
         r.raise_for_status()
         data = r.json()
         c = float(data.get("confidence", 0))
@@ -263,23 +262,21 @@ async def _launch_predict(uid, chat_id, context, reply_fn):
     session = new_session(chat_id)
     user_sessions[uid] = session
 
-    # Fetch predict để lấy latest_session_id và dự đoán
-    predict_data = fetch_predict()
-    session["last_predict"] = predict_data
-
-    if predict_data:
-        latest_id = predict_data.get("latest_session_id")
+    # Lấy trạng thái hiện tại từ API game (nguồn sự thật về phiên)
+    game_sessions = fetch_game_sessions()
+    if game_sessions:
+        latest_id = game_sessions[0].get("id")   # phiên mới nhất đã có kết quả
         session["known_latest"] = latest_id
-
-        # Lấy kết quả thật của latest_session_id từ API game
-        # Đây là phiên VỪA CÓ KẾT QUẢ — chính xác là phiên trước
         if latest_id:
-            game_sessions = fetch_game_sessions()
             res, dices, point = find_result(latest_id, game_sessions)
             session["prev_session"] = str(latest_id)
             session["prev_result"]  = res or "---"
             session["prev_dices"]   = dices
             session["prev_point"]   = point
+
+    # Fetch predict (chỉ 1 lần khi khởi động)
+    predict_data = fetch_predict()
+    session["last_predict"] = predict_data
 
     text, _ = build_ui(session, predict_data)
     msg = await reply_fn(text, action_kb(), "Markdown")
@@ -349,27 +346,40 @@ async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
         context.job.schedule_removal()
         return
 
-    # Fetch predict — đây là nguồn sự thật duy nhất về trạng thái phiên
-    predict_data = fetch_predict()
-    if not predict_data:
+    # ── Bước 1: Poll API game để phát hiện phiên mới (nhẹ hơn gọi predict)
+    game_sessions = fetch_game_sessions()
+    if not game_sessions:
         return
 
-    current_latest = predict_data.get("latest_session_id")
+    current_latest = game_sessions[0].get("id")   # phiên vừa có kết quả
     known_latest   = session.get("known_latest")
 
-    if current_latest and current_latest != known_latest:
-        # ===== PHIÊN MỚI — latest_session_id vừa tăng =====
-        # Lấy kết quả thật của current_latest từ API game
-        game_sessions = fetch_game_sessions()
+    is_new_session = (
+        current_latest is not None
+        and known_latest is not None
+        and current_latest != known_latest
+    )
+
+    if is_new_session:
+        # ── Bước 2: Phiên mới — lấy kết quả thật + fetch predict mới
         res, dices, point = find_result(current_latest, game_sessions)
+        session["prev_session"] = str(current_latest)
+        session["prev_result"]  = res or "---"
+        session["prev_dices"]   = dices
+        session["prev_point"]   = point
+        session["known_latest"] = current_latest
 
-        session["prev_session"]  = str(current_latest)
-        session["prev_result"]   = res or "---"
-        session["prev_dices"]    = dices
-        session["prev_point"]    = point
-        session["known_latest"]  = current_latest
-        session["last_predict"]  = predict_data
+        # Chỉ fetch predict khi phiên mới — tránh spam API
+        predict_data = fetch_predict()
 
+        # Nếu app.py đang training thì chờ, không gửi tin
+        if not predict_data or predict_data.get("status") == "TRAINING":
+            log.info(f"uid={uid} phiên mới nhưng AI đang training, chờ...")
+            session["last_predict"] = predict_data
+            # Vẫn update known_latest để không trigger lại
+            return
+
+        session["last_predict"] = predict_data
         text, _ = build_ui(session, predict_data)
         try:
             msg = await context.bot.send_message(
@@ -379,12 +389,14 @@ async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
             session["message_id"] = msg.message_id
-            log.info(f"uid={uid} phiên mới latest={current_latest} => gửi dự đoán mới")
+            log.info(f"uid={uid} phiên mới latest={current_latest} => gửi dự đoán")
         except Exception as e:
             log.error(f"auto_predict send_message lỗi uid={uid}: {e}")
 
     else:
-        # ===== CÙNG PHIÊN — chỉ edit cập nhật giờ, không gọi API predict lại =====
+        # ── Cùng phiên — chỉ edit cập nhật giờ, không gọi predict
+        if known_latest is None and current_latest is not None:
+            session["known_latest"] = current_latest
         text, _ = build_ui(session, session["last_predict"])
         try:
             await context.bot.edit_message_text(
