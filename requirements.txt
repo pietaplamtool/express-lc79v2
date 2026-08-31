@@ -1,10 +1,10 @@
-setuptools
-wheel
-requests
-psycopg2-binary
-redis
 flask
 flask-cors
 numpy
 python-dotenv
+requests
+redis
+psycopg2-binary
 python-telegram-bot==20.0
+setuptools
+wheel
