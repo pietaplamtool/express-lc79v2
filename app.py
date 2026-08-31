@@ -877,16 +877,128 @@ def predict():
 def stats():
     with ai._lock:
         return jsonify({
-            "total_rounds":   ai.total_rounds,
-            "trained":        ai.trained,
-            "meta_weights":   {k: round(v, 3) for k, v in ai.meta.weights.items()},
-            "meta_accuracy":  round(
+            "total_rounds":     ai.total_rounds,
+            "trained":          ai.trained,
+            "meta_weights":     {k: round(v, 3) for k, v in ai.meta.weights.items()},
+            "meta_accuracy":    round(
                 ai.meta.accuracy["correct"] / ai.meta.accuracy["total"], 4
             ) if ai.meta.accuracy["total"] > 0 else 0,
             "pattern_patterns": len(ai.pattern.pattern_stats),
-            "markov_states":  {o: len(ai.markov.tables[o]) for o in ai.markov.ORDERS},
-            "streak_stats":   len(ai.streak.streak_stats),
+            "markov_states":    {o: len(ai.markov.tables[o]) for o in ai.markov.ORDERS},
+            "streak_stats":     len(ai.streak.streak_stats),
         })
+
+@app.route("/summary_50")
+def summary_50():
+    """50 van gan nhat: ty le TAI/XIU, streak, pattern."""
+    with ai._lock:
+        h    = ai.history[-50:]    if len(ai.history)    >= 50 else ai.history[:]
+        sids = ai.session_ids[-50:] if len(ai.session_ids) >= 50 else ai.session_ids[:]
+    if not h:
+        return jsonify({"error": "Chua co du lieu"}), 503
+    tai_count = sum(h)
+    xiu_count = len(h) - tai_count
+    val, slen = ai.streak._current_streak(h)
+    pattern_now = ai.pattern._identify_pattern(h[-13:]) if len(h) >= 13 else "UNKNOWN"
+    sequence = "".join("T" if x == TAI else "X" for x in h)
+    return jsonify({
+        "window":         len(h),
+        "tai_count":      tai_count,
+        "xiu_count":      xiu_count,
+        "tai_pct":        round(tai_count / len(h) * 100, 1),
+        "xiu_pct":        round(xiu_count / len(h) * 100, 1),
+        "current_streak": {"value": result_label(val), "length": slen},
+        "pattern_13":     pattern_now,
+        "sequence":       sequence,
+        "latest_ids":     sids[-10:],
+    })
+
+@app.route("/streak_20")
+def streak_20():
+    """Phan tich streak 20 van gan nhat."""
+    with ai._lock:
+        h = ai.history[-20:] if len(ai.history) >= 20 else ai.history[:]
+    if not h:
+        return jsonify({"error": "Chua co du lieu"}), 503
+    streaks = []
+    cur_val, cur_len = h[0], 1
+    for v in h[1:]:
+        if v == cur_val:
+            cur_len += 1
+        else:
+            streaks.append({"value": result_label(cur_val), "length": cur_len})
+            cur_val, cur_len = v, 1
+    streaks.append({"value": result_label(cur_val), "length": cur_len})
+    p_tai = sum(h) / len(h)
+    ent   = entropy(p_tai)
+    val, slen = ai.streak._current_streak(h)
+    key = (val, min(slen, 10))
+    with ai._lock:
+        st = dict(ai.streak.streak_stats.get(key, {"break": 0, "continue": 0}))
+    total = st["break"] + st["continue"]
+    p_break = round(st["break"] / total if total >= 5 else min(0.3 + slen * 0.08, 0.75), 3)
+    return jsonify({
+        "window":          len(h),
+        "streaks":         streaks,
+        "current_streak":  {"value": result_label(val), "length": slen},
+        "p_break":         p_break,
+        "p_continue":      round(1 - p_break, 3),
+        "entropy":         round(ent, 4),
+        "stability":       "STABLE" if ent < 0.7 else ("MODERATE" if ent < 0.95 else "CHAOTIC"),
+        "tai_pct":         round(p_tai * 100, 1),
+        "xiu_pct":         round((1 - p_tai) * 100, 1),
+    })
+
+@app.route("/accuracy")
+def accuracy():
+    """Accuracy thuc te cua tung engine va meta."""
+    def _acc(correct, total):
+        return round(correct / total * 100, 2) if total > 0 else 0.0
+    with ai._lock:
+        pattern_accs = {
+            pname: {"accuracy": _acc(pst.get("correct", 0), pst.get("total", 0)), "total": pst.get("total", 0)}
+            for pname, pst in ai.pattern.pattern_stats.items()
+            if pst.get("total", 0) >= 10
+        }
+        top_patterns = dict(sorted(pattern_accs.items(), key=lambda x: -x[1]["total"])[:10])
+        markov_accs  = {
+            f"order_{o}": {"accuracy": _acc(ai.markov.accuracy[o]["correct"], ai.markov.accuracy[o]["total"]),
+                           "total": ai.markov.accuracy[o]["total"]}
+            for o in ai.markov.ORDERS
+        }
+        streak_d = dict(ai.streak.accuracy)
+        freq_d   = dict(ai.frequency.accuracy)
+        meta_d   = dict(ai.meta.accuracy)
+        weights  = dict(ai.meta.weights)
+        cstreak  = ai.meta.all_wrong_streak
+    return jsonify({
+        "meta":              {"accuracy": _acc(meta_d["correct"], meta_d["total"]),
+                              "correct": meta_d["correct"], "total": meta_d["total"]},
+        "engines":           {"markov":    markov_accs,
+                              "streak":    {"accuracy": _acc(streak_d["correct"], streak_d["total"]),
+                                            "total": streak_d["total"]},
+                              "frequency": {"accuracy": _acc(freq_d["correct"], freq_d["total"]),
+                                            "total": freq_d["total"]}},
+        "top_patterns":      top_patterns,
+        "meta_weights":      {k: round(v, 4) for k, v in weights.items()},
+        "contrarian_streak": cstreak,
+    })
+
+@app.route("/history")
+def history():
+    """N van gan nhat kem session_id. ?limit=N (max 200)"""
+    from flask import request as freq_req
+    try:
+        limit = min(int(freq_req.args.get("limit", 50)), 200)
+    except ValueError:
+        limit = 50
+    with ai._lock:
+        h    = ai.history[-limit:]
+        sids = ai.session_ids[-limit:]
+        latest = ai.latest_session_id
+    records = [{"session_id": sids[i] if i < len(sids) else None,
+                "result": result_label(h[i]), "value": h[i]} for i in range(len(h))]
+    return jsonify({"count": len(records), "records": records, "latest_session_id": latest})
 
 # ─────────────────────────────────────────────
 # MAIN
