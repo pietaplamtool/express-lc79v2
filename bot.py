@@ -45,23 +45,40 @@ HISTORY_URL    = (
 )
 FEEDBACK_LINK  = "https://t.me/feedbackkanoai_2026"
 THONGBAO_LINK  = "https://t.me/thongbaokanoai_2026"
-ADMIN_ID       = 7853432590
-ADMIN_USERNAME = "thehpie9"
-ADMIN_BALANCE  = 10_000_000   # 10 triệu
+
+# Danh sách admin
+ADMINS = {
+    7853432590: {"username": "thehpie9",  "balance": 10_000_000},
+    8953969016: {"username": "pie900k",   "balance": 10_000_000},
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ===== BỘ NHỚ =====
-user_data     = {}
-user_sessions = {}
+user_data     = {}   # uid -> dict
+user_sessions = {}   # uid -> dict
 
-# ===== MENU =====
-MENU_KEYBOARD = ReplyKeyboardMarkup([
+# ===== KEYBOARDS =====
+# Menu chính — luôn hiển thị
+MENU_KB = ReplyKeyboardMarkup([
     ["🎮 KHU VỰC GAME",  "👤 HỒ SƠ"],
     ["🔑 MUA GÓI KEY",   "✅ KÍCH HOẠT KEY"],
     ["🎁 NHẬN GIFTCODE", "💰 NẠP TIỀN VÍ"],
     ["📝 FEEDBACK",      "📢 KÊNH THÔNG BÁO"],
+], resize_keyboard=True)
+
+# Keyboard sau khi chọn game — có nút AUTO
+GAME_KB = ReplyKeyboardMarkup([
+    ["⏹ DỪNG DỰ ĐOÁN"],
+    ["🤖 BẬT AUTO DỰ ĐOÁN"],
+    ["🔙 QUAY LẠI MENU"],
+], resize_keyboard=True)
+
+# Keyboard khi AUTO đang chạy
+AUTO_KB = ReplyKeyboardMarkup([
+    ["⏹ DỪNG AUTO"],
+    ["🔙 QUAY LẠI MENU"],
 ], resize_keyboard=True)
 
 WELCOME_TEXT = (
@@ -75,100 +92,78 @@ WELCOME_TEXT = (
 )
 
 # ===== GÓI KEY =====
-# tan_thu: gói tân thủ, chỉ dùng 1 lần, 2 ngày
 KEY_PACKAGES = {
     "tan_thu": {
-        "name": "🎁 Tân Thủ Trải Nghiệm",
-        "price": 1_000,
+        "name":     "🎁 Tân Thủ Trải Nghiệm",
+        "price":    0,
         "duration": "2 ngày",
-        "one_time": True,     # chỉ dùng 1 lần
+        "one_time": True,
     },
     "1_ngay": {
-        "name": "1 Ngày",
-        "price": 10_000,
+        "name":     "1 Ngày",
+        "price":    10_000,
         "duration": "1 ngày",
         "one_time": False,
     },
     "7_ngay": {
-        "name": "7 Ngày",
-        "price": 50_000,
+        "name":     "7 Ngày",
+        "price":    50_000,
         "duration": "7 ngày",
         "one_time": False,
     },
     "30_ngay": {
-        "name": "30 Ngày",
-        "price": 150_000,
+        "name":     "30 Ngày",
+        "price":    150_000,
         "duration": "30 ngày",
         "one_time": False,
     },
     "90_ngay": {
-        "name": "90 Ngày",
-        "price": 350_000,
+        "name":     "90 Ngày",
+        "price":    350_000,
         "duration": "90 ngày",
         "one_time": False,
     },
 }
-
-# ===== KEYBOARD DỰ ĐOÁN =====
-def action_kb(paused=False):
-    rows = []
-    if paused:
-        rows.append([InlineKeyboardButton("▶️ TIẾP TỤC DỰ ĐOÁN", callback_data="resume_game")])
-    else:
-        rows.append([InlineKeyboardButton("⏹ DỪNG DỰ ĐOÁN", callback_data="stop_game")])
-    rows.append([InlineKeyboardButton("🔙 QUAY LẠI", callback_data="back_game")])
-    return InlineKeyboardMarkup(rows)
-
-def game_area_kb():
-    """Keyboard khu vực game — hiện nút AUTO DỰ ĐOÁN."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⭐ BetVip", callback_data="game_betvip")],
-        [InlineKeyboardButton("🤖 AUTO DỰ ĐOÁN", callback_data="auto_mode")],
-        [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")],
-    ])
-
-def auto_kb():
-    """Keyboard khi auto đang chạy."""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏹ DỪNG AUTO", callback_data="stop_auto")],
-        [InlineKeyboardButton("🔙 QUAY LẠI", callback_data="back_game")],
-    ])
 
 # ===== HELPERS =====
 def generate_key():
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
 
 def is_admin(uid, username=""):
-    return uid == ADMIN_ID or (
-        bool(username) and username.lower() == ADMIN_USERNAME.lower()
-    )
+    if uid in ADMINS:
+        return True
+    if username:
+        uname_clean = username.lstrip("@").lower()
+        for info in ADMINS.values():
+            if info["username"].lstrip("@").lower() == uname_clean:
+                return True
+    return False
 
 def ensure_user(uid, username=""):
     if uid not in user_data:
         user_data[uid] = {
-            "balance":       0,
-            "used":          0,
-            "key":           None,
-            "key_expiry":    None,
-            "tan_thu_used":  False,   # gói tân thủ đã dùng chưa
+            "balance":      0,
+            "used":         0,
+            "key":          None,
+            "key_expiry":   None,
+            "tan_thu_used": False,
         }
     if is_admin(uid, username):
-        user_data[uid].update({
-            "balance":    ADMIN_BALANCE,
-            "key":        "ADMIN_UNLIMITED",
-            "key_expiry": "Vĩnh viễn",
-        })
+        admin_balance = ADMINS.get(uid, {}).get("balance", 10_000_000)
+        # Chỉ set balance nếu chưa set hoặc thấp hơn mức admin
+        if user_data[uid]["balance"] < admin_balance:
+            user_data[uid]["balance"] = admin_balance
+        user_data[uid]["key"]        = "ADMIN_UNLIMITED"
+        user_data[uid]["key_expiry"] = "Vĩnh viễn"
 
-def nap_tien_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("1.000đ",   callback_data="nap_1000")],
-        [InlineKeyboardButton("20.000đ",  callback_data="nap_20000")],
-        [InlineKeyboardButton("50.000đ",  callback_data="nap_50000")],
-        [InlineKeyboardButton("100.000đ", callback_data="nap_100000")],
-        [InlineKeyboardButton("200.000đ", callback_data="nap_200000")],
-        [InlineKeyboardButton("500.000đ", callback_data="nap_500000")],
-        [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")],
-    ])
+def _cancel_job(context, uid):
+    if context.job_queue:
+        for job in context.job_queue.get_jobs_by_name(f"auto_{uid}"):
+            job.schedule_removal()
+
+def _deactivate(uid):
+    if uid in user_sessions:
+        user_sessions[uid]["active"] = False
 
 # ===== API =====
 def fetch_predict():
@@ -193,21 +188,11 @@ def fetch_game_sessions():
         return []
 
 def get_latest_finished(sessions):
-    """Lấy phiên mới nhất đã có kết quả thật."""
+    """Phiên mới nhất đã có kết quả thật."""
     for s in sessions:
         if s.get("resultTruyenThong"):
             return s
     return None
-
-def find_result(session_id, sessions):
-    try:
-        sid = int(session_id)
-        for s in sessions:
-            if s.get("id") == sid:
-                return s.get("resultTruyenThong"), s.get("dices"), s.get("point")
-    except Exception:
-        pass
-    return None, None, None
 
 # ===== BUILD UI =====
 def label_result(raw):
@@ -217,9 +202,10 @@ def label_result(raw):
         return "XỈU", "🔵"
     return (raw or "---"), "➖"
 
-def build_ui(session, predict_data, auto_mode=False):
+def build_ui(session, predict_data):
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     sep = "━" * 22
+    auto_tag = "🤖 AUTO · " if session.get("auto_mode") else ""
 
     if predict_data and predict_data.get("status") == "PREDICT":
         target_id              = str(predict_data["target_session_id"])
@@ -237,16 +223,13 @@ def build_ui(session, predict_data, auto_mode=False):
     prev_label, prev_emoji = label_result(session["prev_result"])
     prev_dices = session.get("prev_dices")
     prev_point = session.get("prev_point")
-
-    dice_line = ""
+    dice_line  = ""
     if prev_dices and len(prev_dices) == 3:
         dice_line = f"\n🎲 {prev_dices[0]} · {prev_dices[1]} · {prev_dices[2]}   Tổng: *{prev_point}*"
 
-    mode_tag = "🤖 *AUTO* · " if auto_mode else ""
-
     return (
         f"╔══════════════════════╗\n"
-        f"   {mode_tag}🏆 *KANO AI* · BetVip\n"
+        f"   {auto_tag}🏆 *KANO AI* · BetVip\n"
         f"╚══════════════════════╝\n\n"
         f"{sep}\n"
         f"📡 *DỰ ĐOÁN PHIÊN TIẾP THEO*\n"
@@ -264,7 +247,7 @@ def build_ui(session, predict_data, auto_mode=False):
         f"{sep}\n"
         f"🕒 {now}\n"
         f"{'🟢 *AI ĐANG HOẠT ĐỘNG*' if is_ready else '🔴 *ĐANG CHỜ DỮ LIỆU*'}"
-    ), target_id
+    )
 
 # ===== SESSION =====
 def new_session(chat_id, auto_mode=False):
@@ -286,13 +269,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     uname = update.effective_user.username or ""
     ensure_user(uid, uname)
-    await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KEYBOARD)
+    await update.message.reply_text(
+        WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KB
+    )
 
 # ===== MENU ROUTER =====
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     uname = update.effective_user.username or ""
     ensure_user(uid, uname)
+    text  = update.message.text
+
+    # Nút trên GAME_KB / AUTO_KB
+    if text == "⏹ DỪNG DỰ ĐOÁN":
+        await do_stop(update, context, uid)
+        return
+    if text == "🤖 BẬT AUTO DỰ ĐOÁN":
+        await do_start_auto(update, context, uid)
+        return
+    if text == "⏹ DỪNG AUTO":
+        await do_stop_auto(update, context, uid)
+        return
+    if text == "🔙 QUAY LẠI MENU":
+        _deactivate(uid)
+        _cancel_job(context, uid)
+        await update.message.reply_text(
+            WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KB
+        )
+        return
+
+    # Menu chính
     routes = {
         "🎮 KHU VỰC GAME":   show_game_area,
         "👤 HỒ SƠ":          show_profile,
@@ -303,7 +309,7 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 FEEDBACK":       feedback,
         "📢 KÊNH THÔNG BÁO": thongbao,
     }
-    fn = routes.get(update.message.text)
+    fn = routes.get(text)
     if fn:
         await fn(update, context)
     else:
@@ -312,17 +318,25 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== KHU VỰC GAME =====
 async def show_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎮 *KHU VỰC GAME*\n\nChọn chế độ dự đoán:",
+        "🎮 *KHU VỰC GAME*\n\nHiện tại hỗ trợ game BetVip.\nChọn game để bắt đầu:",
         parse_mode="Markdown",
-        reply_markup=game_area_kb()
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ BetVip", callback_data="game_betvip")],
+            [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")],
+        ])
     )
 
-# ===== CORE: KHỞI ĐỘNG DỰ ĐOÁN =====
-async def _launch_predict(uid, chat_id, context, reply_fn, auto_mode=False):
+# ===== KHỞI ĐỘNG DỰ ĐOÁN (core) =====
+async def _launch(uid, chat_id, context, send_fn, auto_mode=False):
+    """
+    Khởi động session dự đoán.
+    send_fn: async (text, reply_markup) -> Message
+    """
     _cancel_job(context, uid)
     session = new_session(chat_id, auto_mode=auto_mode)
     user_sessions[uid] = session
 
+    # Lấy trạng thái game hiện tại
     game_sessions = fetch_game_sessions()
     if game_sessions:
         finished = get_latest_finished(game_sessions)
@@ -336,22 +350,23 @@ async def _launch_predict(uid, chat_id, context, reply_fn, auto_mode=False):
     predict_data = fetch_predict()
     session["last_predict"] = predict_data
 
-    kb   = auto_kb() if auto_mode else action_kb()
-    text, _ = build_ui(session, predict_data, auto_mode=auto_mode)
-    msg = await reply_fn(text, kb, "Markdown")
+    kb   = AUTO_KB if auto_mode else GAME_KB
+    text = build_ui(session, predict_data)
+    msg  = await send_fn(text, kb)
     session["message_id"] = msg.message_id
     session["chat_id"]    = msg.chat_id
 
     if context.job_queue:
         context.job_queue.run_repeating(
-            auto_predict,
+            auto_predict_job,
             interval=2,
             first=2,
             name=f"auto_{uid}",
             user_id=uid,
         )
 
-async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== CALLBACK: CHỌN GAME =====
+async def cb_game_betvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     uid   = update.effective_user.id
@@ -365,61 +380,78 @@ async def start_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    async def reply_fn(text, kb, pm):
-        return await query.message.reply_text(text, reply_markup=kb, parse_mode=pm)
+    await query.edit_message_text("✅ Đang khởi động BetVip...")
 
-    await _launch_predict(uid, query.message.chat_id, context, reply_fn, auto_mode=False)
+    async def send_fn(text, kb):
+        return await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text, reply_markup=kb, parse_mode="Markdown"
+        )
 
-async def start_auto_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bật AUTO DỰ ĐOÁN — bot tự động gửi dự đoán mỗi phiên mới."""
-    query = update.callback_query
-    await query.answer()
-    uid   = update.effective_user.id
+    await _launch(uid, query.message.chat_id, context, send_fn, auto_mode=False)
+
+# ===== BẬT AUTO (từ nút keyboard) =====
+async def do_start_auto(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
     uname = update.effective_user.username or ""
     ensure_user(uid, uname)
 
     if not user_data[uid].get("key"):
-        await query.edit_message_text(
+        await update.message.reply_text(
             "❌ *Bạn chưa có KEY VIP!*\n\nMua key tại mục `🔑 MUA GÓI KEY`.",
             parse_mode="Markdown"
         )
         return
 
-    async def reply_fn(text, kb, pm):
-        return await query.message.reply_text(text, reply_markup=kb, parse_mode=pm)
+    await update.message.reply_text(
+        "🤖 *AUTO DỰ ĐOÁN đã bật!*\n\nBot sẽ tự động gửi dự đoán mỗi khi có kết quả mới.",
+        parse_mode="Markdown",
+        reply_markup=AUTO_KB
+    )
 
-    await _launch_predict(uid, query.message.chat_id, context, reply_fn, auto_mode=True)
+    async def send_fn(text, kb):
+        return await update.message.reply_text(
+            text, reply_markup=kb, parse_mode="Markdown"
+        )
 
-async def resume_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
-    ensure_user(uid, uname)
+    await _launch(uid, update.message.chat_id, context, send_fn, auto_mode=True)
 
-    if not user_data[uid].get("key"):
-        await query.edit_message_text("❌ *Bạn chưa có KEY VIP!*", parse_mode="Markdown")
-        return
+# ===== DỪNG DỰ ĐOÁN THƯỜNG =====
+async def do_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
+    _deactivate(uid)
+    _cancel_job(context, uid)
+    await update.message.reply_text(
+        "⏹ *Đã dừng dự đoán.*\n\nBấm 🤖 BẬT AUTO DỰ ĐOÁN để tiếp tục hoặc 🔙 QUAY LẠI MENU.",
+        parse_mode="Markdown",
+        reply_markup=GAME_KB
+    )
 
-    # Giữ lại auto_mode của session cũ nếu có
-    old_session = user_sessions.get(uid)
-    was_auto    = old_session.get("auto_mode", False) if old_session else False
+# ===== DỪNG AUTO =====
+async def do_stop_auto(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
+    _deactivate(uid)
+    _cancel_job(context, uid)
+    await update.message.reply_text(
+        "⏹ *Đã dừng AUTO dự đoán.*\n\nBấm 🤖 BẬT AUTO DỰ ĐOÁN để bật lại.",
+        parse_mode="Markdown",
+        reply_markup=GAME_KB
+    )
 
-    async def reply_fn(text, kb, pm):
-        return await query.message.reply_text(text, reply_markup=kb, parse_mode=pm)
-
-    await query.edit_message_reply_markup(reply_markup=None)
-    await _launch_predict(uid, query.message.chat_id, context, reply_fn, auto_mode=was_auto)
-
-# ===== AUTO JOB =====
-async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
+# ===== AUTO JOB (2 giây/lần) =====
+async def auto_predict_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Mỗi 2 giây:
+    - Poll API game, lấy phiên mới nhất đã có kết quả.
+    - Nếu ID thay đổi → phiên mới vừa ra kết quả
+      → fetch dự đoán mới và gửi tin ngay.
+    - Nếu cùng phiên → chỉ edit cập nhật giờ (không gọi predict API).
+    """
     uid     = context.job.user_id
     session = user_sessions.get(uid)
     if not session or not session["active"]:
         context.job.schedule_removal()
         return
 
-    auto_mode = session.get("auto_mode", False)
+    auto_mode     = session.get("auto_mode", False)
+    kb            = AUTO_KB if auto_mode else GAME_KB
 
     game_sessions = fetch_game_sessions()
     if not game_sessions:
@@ -438,22 +470,24 @@ async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
         and current_latest != known_latest
     )
 
-    kb = auto_kb() if auto_mode else action_kb()
-
     if is_new:
+        # Kết quả mới vừa ra — cập nhật phiên trước
         session["prev_session"] = str(current_latest)
         session["prev_result"]  = finished.get("resultTruyenThong") or "---"
         session["prev_dices"]   = finished.get("dices")
         session["prev_point"]   = finished.get("point")
         session["known_latest"] = current_latest
 
+        # Fetch dự đoán phiên tiếp theo
         predict_data = fetch_predict()
         if not predict_data or predict_data.get("status") == "TRAINING":
             session["last_predict"] = predict_data
+            log.info(f"uid={uid} phiên mới={current_latest} nhưng AI đang training")
             return
 
         session["last_predict"] = predict_data
-        text, _ = build_ui(session, predict_data, auto_mode=auto_mode)
+        text = build_ui(session, predict_data)
+
         try:
             msg = await context.bot.send_message(
                 chat_id=session["chat_id"],
@@ -462,13 +496,16 @@ async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
             session["message_id"] = msg.message_id
-            log.info(f"uid={uid} phiên mới={current_latest} auto={auto_mode} => gửi dự đoán")
+            log.info(f"uid={uid} gửi dự đoán phiên mới latest={current_latest}")
         except Exception as e:
-            log.error(f"auto_predict send lỗi uid={uid}: {e}")
+            log.error(f"auto_predict_job send lỗi uid={uid}: {e}")
+
     else:
+        # Cùng phiên — chỉ edit cập nhật giờ
         if known_latest is None and current_latest is not None:
             session["known_latest"] = current_latest
-        text, _ = build_ui(session, session["last_predict"], auto_mode=auto_mode)
+
+        text = build_ui(session, session["last_predict"])
         try:
             await context.bot.edit_message_text(
                 text,
@@ -479,44 +516,9 @@ async def auto_predict(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             if "not modified" not in str(e).lower():
-                log.error(f"auto_predict edit lỗi uid={uid}: {e}")
+                log.error(f"auto_predict_job edit lỗi uid={uid}: {e}")
 
-# ===== DỪNG / QUAY LẠI =====
-def _cancel_job(context, uid):
-    if context.job_queue:
-        for job in context.job_queue.get_jobs_by_name(f"auto_{uid}"):
-            job.schedule_removal()
-
-def _deactivate(uid):
-    if uid in user_sessions:
-        user_sessions[uid]["active"] = False
-
-async def stop_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    _deactivate(uid)
-    _cancel_job(context, uid)
-    await query.edit_message_reply_markup(reply_markup=action_kb(paused=True))
-
-async def stop_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Dừng chế độ AUTO."""
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    _deactivate(uid)
-    _cancel_job(context, uid)
-    # Đổi keyboard về trạng thái paused với nút Tiếp Tục
-    await query.edit_message_reply_markup(reply_markup=action_kb(paused=True))
-
-async def back_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid = update.effective_user.id
-    _deactivate(uid)
-    _cancel_job(context, uid)
-    await query.edit_message_text("🔙 *Đã quay lại.*\n\nChọn menu bên dưới.", parse_mode="Markdown")
-
+# ===== INLINE CALLBACKS =====
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -549,17 +551,15 @@ async def show_key_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     uname = update.effective_user.username or ""
     ensure_user(uid, uname)
-
-    rows = []
+    rows  = []
     for k, p in KEY_PACKAGES.items():
-        # Nếu gói tân thủ đã dùng → hiện mờ (thêm dấu ✗)
         if p.get("one_time") and user_data[uid].get("tan_thu_used"):
-            label = f"{p['name']} — {p['price']:,}đ  ✗ Đã dùng"
+            label = f"{p['name']} — Đã dùng ✗"
             rows.append([InlineKeyboardButton(label, callback_data="tan_thu_used")])
         else:
-            label = f"{p['name']} — {p['price']:,}đ"
+            price_str = "FREE" if p["price"] == 0 else f"{p['price']:,}đ"
+            label = f"{p['name']} — {price_str}"
             rows.append([InlineKeyboardButton(label, callback_data=f"buykey_{k}")])
-
     rows.append([InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")])
     await update.message.reply_text(
         "🔑 *MUA GÓI KEY VIP*\n\nChọn gói phù hợp:",
@@ -586,12 +586,13 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin = is_admin(uid, uname)
 
-    # Kiểm tra gói tân thủ đã dùng chưa
+    # Kiểm tra tân thủ đã dùng
     if pkg.get("one_time") and user_data[uid].get("tan_thu_used") and not admin:
         await query.answer("Bạn đã sử dụng gói Tân Thủ rồi!", show_alert=True)
         return
 
-    if not admin:
+    # Kiểm tra số dư (gói free thì bỏ qua)
+    if not admin and pkg["price"] > 0:
         if user_data[uid]["balance"] < pkg["price"]:
             await query.answer(
                 f"Số dư không đủ! Cần {pkg['price']:,}đ, hiện có {user_data[uid]['balance']:,}đ.",
@@ -600,15 +601,17 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         user_data[uid]["balance"] -= pkg["price"]
         user_data[uid]["used"]    += pkg["price"]
-        if pkg.get("one_time"):
-            user_data[uid]["tan_thu_used"] = True
+
+    if pkg.get("one_time") and not admin:
+        user_data[uid]["tan_thu_used"] = True
 
     new_key  = "ADMIN_UNLIMITED" if admin else generate_key()
     duration = "Vĩnh viễn"       if admin else pkg["duration"]
     user_data[uid]["key"]        = new_key
     user_data[uid]["key_expiry"] = duration
 
-    one_time_note = "\n⚠️ *Gói tân thủ chỉ dùng được 1 lần.*" if pkg.get("one_time") and not admin else ""
+    price_str    = "Miễn phí" if pkg["price"] == 0 else f"{pkg['price']:,}đ"
+    one_time_note = "\n⚠️ *Gói này chỉ dùng được 1 lần.*" if pkg.get("one_time") and not admin else ""
 
     await query.edit_message_text(
         f"╔══════════════════════╗\n"
@@ -617,7 +620,7 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📦 Gói: *{pkg['name']}*\n"
         f"🔑 Key: `{new_key}`\n"
         f"⏰ Hạn: *{duration}*\n"
-        f"💰 Đã trừ: *{0 if admin else pkg['price']:,}đ*"
+        f"💰 Chi phí: *{price_str}*"
         f"{one_time_note}\n\n"
         f"Dùng lệnh `/active {new_key}` để kích hoạt.",
         parse_mode="Markdown"
@@ -662,7 +665,15 @@ async def show_nap_tien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "💰 *NẠP TIỀN VÍ*\n\nChọn số tiền:",
         parse_mode="Markdown",
-        reply_markup=nap_tien_kb()
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("1.000đ",   callback_data="nap_1000")],
+            [InlineKeyboardButton("20.000đ",  callback_data="nap_20000")],
+            [InlineKeyboardButton("50.000đ",  callback_data="nap_50000")],
+            [InlineKeyboardButton("100.000đ", callback_data="nap_100000")],
+            [InlineKeyboardButton("200.000đ", callback_data="nap_200000")],
+            [InlineKeyboardButton("500.000đ", callback_data="nap_500000")],
+            [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")],
+        ])
     )
 
 async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -679,24 +690,20 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"https://img.vietqr.io/image/MB-0844551151-compact.png"
         f"?amount={amount}&addInfo={note}&accountName=PHAM%20THE%20HIEN"
     )
-
-    # Lệnh nạp tiền cho admin
-    admin_cmd = f"/naptien {note} {amount}"
-
     caption = (
         f"╔══════════════════════╗\n"
         f"   💰 *THÔNG TIN NẠP TIỀN*\n"
         f"╚══════════════════════╝\n\n"
-        f"🏦 Bank:    *MBBANK*\n"
-        f"👤 Tên:     *PHAM THE HIEN*\n"
-        f"🔢 STK:     *0844551151*\n"
+        f"🏦 Bank:     *MBBANK*\n"
+        f"👤 Tên:      *PHAM THE HIEN*\n"
+        f"🔢 STK:      *0844551151*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Số tiền: *{amount:,}đ*\n"
+        f"💵 Số tiền:  *{amount:,}đ*\n"
         f"📝 Nội dung: `{note}`\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ *Nhập đúng nội dung* `{note}`\n"
-        f"để hệ thống xác nhận tự động.\n\n"
-        f"✅ Số dư sẽ được cộng ngay sau khi\n"
+        f"⚠️ Nhập đúng nội dung `{note}`\n"
+        f"để hệ thống xác nhận giao dịch.\n\n"
+        f"✅ Số dư cộng ngay sau khi\n"
         f"admin xác nhận chuyển khoản."
     )
     await query.message.reply_photo(photo=qr_url, caption=caption, parse_mode="Markdown")
@@ -709,10 +716,7 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== LỆNH NẠP TIỀN CHO ADMIN =====
 async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin dùng: /naptien <user_id> <so_tien>
-    Hoặc: /naptien <ma_giao_dich> <so_tien>  (tra cứu thủ công)
-    """
+    """Admin: /naptien <user_id> <so_tien>"""
     uid   = update.effective_user.id
     uname = update.effective_user.username or ""
     if not is_admin(uid, uname):
@@ -732,11 +736,13 @@ async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_uid = int(args[0])
         amount     = int(args[1])
     except ValueError:
-        await update.message.reply_text("❌ user_id và số tiền phải là số nguyên.")
+        await update.message.reply_text("❌ user_id và số tiền phải là số.")
         return
 
     if target_uid not in user_data:
-        await update.message.reply_text(f"❌ Không tìm thấy user ID `{target_uid}`.", parse_mode="Markdown")
+        await update.message.reply_text(
+            f"❌ Không tìm thấy user ID `{target_uid}`.", parse_mode="Markdown"
+        )
         return
 
     user_data[target_uid]["balance"] += amount
@@ -747,12 +753,11 @@ async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   ✅ *NẠP TIỀN THÀNH CÔNG*\n"
         f"╚══════════════════════╝\n\n"
         f"👤 User ID: `{target_uid}`\n"
-        f"💵 Số tiền nạp: *+{amount:,}đ*\n"
+        f"💵 Nạp: *+{amount:,}đ*\n"
         f"💰 Số dư mới: *{new_balance:,}đ*",
         parse_mode="Markdown"
     )
 
-    # Thông báo cho user được nạp
     try:
         await context.bot.send_message(
             chat_id=target_uid,
@@ -763,12 +768,12 @@ async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💵 Số tiền: *+{amount:,}đ*\n"
                 f"💰 Số dư hiện tại: *{new_balance:,}đ*\n\n"
                 f"✅ Giao dịch đã được xác nhận!\n"
-                f"Cảm ơn bạn đã nạp tiền vào Kano AI."
+                f"Cảm ơn bạn đã nạp tiền vào Kano AI. 🙏"
             ),
             parse_mode="Markdown"
         )
     except Exception as e:
-        log.warning(f"Không gửi được thông báo nạp tiền cho uid={target_uid}: {e}")
+        log.warning(f"Không thể gửi thông báo nạp tiền cho uid={target_uid}: {e}")
 
 # ===== FEEDBACK & THÔNG BÁO =====
 async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -793,26 +798,21 @@ async def thongbao(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start",    start))
-    app.add_handler(CommandHandler("active",   cmd_active))
-    app.add_handler(CommandHandler("naptien",  cmd_naptien))
+    app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("active",  cmd_active))
+    app.add_handler(CommandHandler("naptien", cmd_naptien))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
-    app.add_handler(CallbackQueryHandler(start_game,        pattern="^game_betvip$"))
-    app.add_handler(CallbackQueryHandler(start_auto_mode,   pattern="^auto_mode$"))
-    app.add_handler(CallbackQueryHandler(resume_game,       pattern="^resume_game$"))
-    app.add_handler(CallbackQueryHandler(stop_game,         pattern="^stop_game$"))
-    app.add_handler(CallbackQueryHandler(stop_auto,         pattern="^stop_auto$"))
-    app.add_handler(CallbackQueryHandler(back_game,         pattern="^back_game$"))
-    app.add_handler(CallbackQueryHandler(back_main,         pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(buy_key,           pattern="^buykey_"))
+    app.add_handler(CallbackQueryHandler(cb_game_betvip,      pattern="^game_betvip$"))
+    app.add_handler(CallbackQueryHandler(back_main,           pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(buy_key,             pattern="^buykey_"))
     app.add_handler(CallbackQueryHandler(tan_thu_used_notice, pattern="^tan_thu_used$"))
-    app.add_handler(CallbackQueryHandler(generate_qr,       pattern="^nap_"))
+    app.add_handler(CallbackQueryHandler(generate_qr,         pattern="^nap_"))
 
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
 
-    log.info("Bot Kano AI v7 đang chạy...")
+    log.info("Bot Kano AI v8 đang chạy...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
