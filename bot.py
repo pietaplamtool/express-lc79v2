@@ -14,6 +14,7 @@ from telegram.ext import (
 
 # ===== FLASK KEEPALIVE =====
 flask_app = Flask(__name__)
+BOT_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 @flask_app.route("/")
 def health():
@@ -22,6 +23,22 @@ def health():
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+def self_ping():
+    """
+    Ping chính mình mỗi 10 phút để Render không spin down.
+    RENDER_EXTERNAL_URL được Render tự inject (ví dụ: https://bettv-telegram-bot.onrender.com).
+    """
+    import time as _time
+    _time.sleep(30)   # Chờ Flask khởi động xong
+    while True:
+        try:
+            url = BOT_URL or "https://bettv-telegram-bot.onrender.com"
+            requests.get(url, timeout=10)
+            log.info("Self-ping OK")
+        except Exception as e:
+            log.warning(f"Self-ping lỗi: {e}")
+        _time.sleep(600)   # 10 phút
 
 # ===== CẤU HÌNH =====
 TOKEN        = "8891039285:AAGuzG0fdsycHSsIhogbth3dvnzE16PTziw"
@@ -621,6 +638,7 @@ def main():
     app.add_handler(CallbackQueryHandler(generate_qr, pattern="^nap_"))
 
     threading.Thread(target=run_flask, daemon=True).start()
+    threading.Thread(target=self_ping, daemon=True).start()
 
     log.info("Bot Kano AI v6 đang chạy...")
     app.run_polling(drop_pending_updates=True)
