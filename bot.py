@@ -14,7 +14,7 @@ from telegram.ext import (
 
 # ===== FLASK KEEPALIVE =====
 flask_app = Flask(__name__)
-BOT_URL = os.environ.get("RENDER_EXTERNAL_URL", "")
+BOT_URL   = os.environ.get("RENDER_EXTERNAL_URL", "")
 
 @flask_app.route("/")
 def health():
@@ -29,8 +29,7 @@ def self_ping():
     _t.sleep(30)
     while True:
         try:
-            url = BOT_URL or "https://bettv-telegram-bot.onrender.com"
-            requests.get(url, timeout=10)
+            requests.get(BOT_URL or "https://bettv-telegram-bot.onrender.com", timeout=10)
             log.info("Self-ping OK")
         except Exception as e:
             log.warning(f"Self-ping lỗi: {e}")
@@ -46,8 +45,7 @@ HISTORY_URL   = (
 FEEDBACK_LINK = "https://t.me/feedbackkanoai_2026"
 THONGBAO_LINK = "https://t.me/thongbaokanoai_2026"
 
-# Admin thật sự (có quyền admin)
-ADMIN_IDS      = {7853432590}
+ADMIN_IDS       = {7853432590}
 ADMIN_USERNAMES = {"thehpie9"}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -65,15 +63,9 @@ MENU_KB = ReplyKeyboardMarkup([
     ["📝 FEEDBACK",      "📢 KÊNH THÔNG BÁO"],
 ], resize_keyboard=True)
 
-# Keyboard khi đang dự đoán thủ công
-PREDICT_KB = ReplyKeyboardMarkup([
-    ["⏹ DỪNG DỰ ĐOÁN",       "🤖 BẬT AUTO DỰ ĐOÁN"],
-    ["🔙 QUAY LẠI MENU"],
-], resize_keyboard=True)
-
-# Keyboard khi AUTO đang chạy
-AUTO_KB = ReplyKeyboardMarkup([
-    ["⏹ DỪNG AUTO DỰ ĐOÁN"],
+# Keyboard sau khi bắt đầu auto
+PLAYING_KB = ReplyKeyboardMarkup([
+    ["⏹ DỪNG DỰ ĐOÁN"],
     ["🔙 QUAY LẠI MENU"],
 ], resize_keyboard=True)
 
@@ -89,16 +81,11 @@ WELCOME_TEXT = (
 
 # ===== GÓI KEY =====
 KEY_PACKAGES = {
-    "tan_thu": {
-        "name": "🎁 Tân Thủ Trải Nghiệm",
-        "price": 0,
-        "duration": "2 ngày",
-        "one_time": True,
-    },
-    "1_ngay":  {"name": "1 Ngày",  "price": 10_000,  "duration": "1 ngày",  "one_time": False},
-    "7_ngay":  {"name": "7 Ngày",  "price": 50_000,  "duration": "7 ngày",  "one_time": False},
-    "30_ngay": {"name": "30 Ngày", "price": 150_000, "duration": "30 ngày", "one_time": False},
-    "90_ngay": {"name": "90 Ngày", "price": 350_000, "duration": "90 ngày", "one_time": False},
+    "tan_thu": {"name": "🎁 Tân Thủ Trải Nghiệm", "price": 0,       "duration": "2 ngày",  "one_time": True},
+    "1_ngay":  {"name": "1 Ngày",                  "price": 10_000,  "duration": "1 ngày",  "one_time": False},
+    "7_ngay":  {"name": "7 Ngày",                  "price": 50_000,  "duration": "7 ngày",  "one_time": False},
+    "30_ngay": {"name": "30 Ngày",                 "price": 150_000, "duration": "30 ngày", "one_time": False},
+    "90_ngay": {"name": "90 Ngày",                 "price": 350_000, "duration": "90 ngày", "one_time": False},
 }
 
 # ===== HELPERS =====
@@ -115,21 +102,16 @@ def is_admin(uid, username=""):
 def ensure_user(uid, username=""):
     if uid not in user_data:
         user_data[uid] = {
-            "balance":      0,
-            "used":         0,
-            "key":          None,
-            "key_expiry":   None,
-            "tan_thu_used": False,
-            "label":        None,   # nhãn đặc biệt (ví dụ "Quản lý")
+            "balance": 0, "used": 0,
+            "key": None, "key_expiry": None,
+            "tan_thu_used": False, "label": None,
         }
-    # Cấp quyền admin thật
     if is_admin(uid, username):
         user_data[uid]["key"]        = "ADMIN_UNLIMITED"
         user_data[uid]["key_expiry"] = "Vĩnh viễn"
         if user_data[uid]["balance"] < 10_000_000:
             user_data[uid]["balance"] = 10_000_000
-
-    # Tài khoản đặc biệt: pie900k — quản lý, 100 triệu, KHÔNG có quyền admin
+    # pie900k: quản lý, 100 triệu, KHÔNG có quyền admin
     if uid == 8953969016 or (username and username.lstrip("@").lower() == "pie900k"):
         if user_data[uid]["balance"] < 100_000_000:
             user_data[uid]["balance"] = 100_000_000
@@ -167,6 +149,7 @@ def fetch_game_sessions():
         return []
 
 def get_latest_finished(sessions):
+    """Phiên mới nhất đã có kết quả thật (resultTruyenThong != None)."""
     for s in sessions:
         if s.get("resultTruyenThong"):
             return s
@@ -174,16 +157,13 @@ def get_latest_finished(sessions):
 
 # ===== BUILD UI =====
 def label_result(raw):
-    if raw in ("TAI", "T", "TÀI"):
-        return "TÀI", "🔴"
-    if raw in ("XIU", "X", "XỈU"):
-        return "XỈU", "🔵"
+    if raw in ("TAI", "T", "TÀI"):   return "TÀI", "🔴"
+    if raw in ("XIU", "X", "XỈU"):   return "XỈU", "🔵"
     return (raw or "---"), "➖"
 
 def build_ui(session, predict_data):
-    now      = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    sep      = "━" * 22
-    auto_tag = "🤖 AUTO · " if session.get("auto_mode") else ""
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    sep = "━" * 22
 
     if predict_data and predict_data.get("status") == "PREDICT":
         target_id              = str(predict_data["target_session_id"])
@@ -197,17 +177,17 @@ def build_ui(session, predict_data):
         conf       = 0.0
         is_ready   = False
 
-    bar            = "▰" * int(conf / 100 * 12) + "▱" * (12 - int(conf / 100 * 12))
+    bar                    = "▰" * int(conf / 100 * 12) + "▱" * (12 - int(conf / 100 * 12))
     prev_label, prev_emoji = label_result(session["prev_result"])
-    prev_dices     = session.get("prev_dices")
-    prev_point     = session.get("prev_point")
-    dice_line      = ""
+    prev_dices             = session.get("prev_dices")
+    prev_point             = session.get("prev_point")
+    dice_line              = ""
     if prev_dices and len(prev_dices) == 3:
         dice_line = f"\n🎲 {prev_dices[0]} · {prev_dices[1]} · {prev_dices[2]}   Tổng: *{prev_point}*"
 
     return (
         f"╔══════════════════════╗\n"
-        f"   {auto_tag}🏆 *KANO AI* · BetVip\n"
+        f"      🏆 *KANO AI* · BetVip\n"
         f"╚══════════════════════╝\n\n"
         f"{sep}\n"
         f"📡 *DỰ ĐOÁN PHIÊN TIẾP THEO*\n"
@@ -227,29 +207,12 @@ def build_ui(session, predict_data):
         f"{'🟢 *AI ĐANG HOẠT ĐỘNG*' if is_ready else '🔴 *ĐANG CHỜ DỮ LIỆU*'}"
     )
 
-# ===== SESSION =====
-def new_session(chat_id, auto_mode=False):
-    return {
-        "active":       True,
-        "auto_mode":    auto_mode,
-        "chat_id":      chat_id,
-        "message_id":   None,
-        "prev_session": "---",
-        "prev_result":  "---",
-        "prev_dices":   None,
-        "prev_point":   None,
-        "known_latest": None,
-        "last_predict": None,
-    }
-
 # ===== /START =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     uname = update.effective_user.username or ""
     ensure_user(uid, uname)
-    await update.message.reply_text(
-        WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KB
-    )
+    await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KB)
 
 # ===== MENU ROUTER =====
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -258,26 +221,11 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(uid, uname)
     text  = update.message.text
 
-    # Nút trên PREDICT_KB
     if text == "⏹ DỪNG DỰ ĐOÁN":
         _deactivate(uid)
         _cancel_job(context, uid)
         await update.message.reply_text(
-            "⏹ *Đã dừng dự đoán.*\n\nBấm 🤖 BẬT AUTO để tiếp tục tự động\nhoặc vào lại KHU VỰC GAME.",
-            parse_mode="Markdown", reply_markup=MENU_KB
-        )
-        return
-
-    if text == "🤖 BẬT AUTO DỰ ĐOÁN":
-        await _switch_to_auto(update, context, uid)
-        return
-
-    # Nút trên AUTO_KB
-    if text == "⏹ DỪNG AUTO DỰ ĐOÁN":
-        _deactivate(uid)
-        _cancel_job(context, uid)
-        await update.message.reply_text(
-            "⏹ *Đã dừng AUTO dự đoán.*\n\nVào lại KHU VỰC GAME để tiếp tục.",
+            "⏹ *Đã dừng dự đoán.*\n\nVào lại KHU VỰC GAME để tiếp tục.",
             parse_mode="Markdown", reply_markup=MENU_KB
         )
         return
@@ -290,7 +238,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Menu chính
     routes = {
         "🎮 KHU VỰC GAME":   show_game_area,
         "👤 HỒ SƠ":          show_profile,
@@ -310,82 +257,25 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== KHU VỰC GAME =====
 async def show_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎮 *KHU VỰC GAME*\n\nChọn game để bắt đầu dự đoán:",
+        "🎮 *KHU VỰC GAME*\n\nChọn game bạn muốn dự đoán:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ BetVip — Dự đoán thủ công", callback_data="game_betvip")],
-            [InlineKeyboardButton("🤖 BetVip — AUTO Dự đoán",    callback_data="game_betvip_auto")],
-            [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")],
+            [InlineKeyboardButton("⭐ BetVip",               callback_data="select_betvip")],
+            [InlineKeyboardButton("🔒 LC79 — Coming Soon",    callback_data="coming_soon")],
+            [InlineKeyboardButton("🔒 Max789 — Coming Soon",  callback_data="coming_soon")],
+            [InlineKeyboardButton("🔒 HitClub — Coming Soon", callback_data="coming_soon")],
+            [InlineKeyboardButton("🔙 Quay lại",             callback_data="back_main")],
         ])
     )
 
-# ===== CORE LAUNCH =====
-async def _launch(uid, chat_id, context, send_fn, auto_mode=False):
-    """
-    Khởi động session và job poll.
-    send_fn: async(text, reply_markup) -> Message
-    """
-    _cancel_job(context, uid)
-    session = new_session(chat_id, auto_mode=auto_mode)
-    user_sessions[uid] = session
-
-    # Snapshot game hiện tại
-    game_sessions = fetch_game_sessions()
-    if game_sessions:
-        finished = get_latest_finished(game_sessions)
-        if finished:
-            session["known_latest"] = finished.get("id")
-            session["prev_session"] = str(finished.get("id", "---"))
-            session["prev_result"]  = finished.get("resultTruyenThong") or "---"
-            session["prev_dices"]   = finished.get("dices")
-            session["prev_point"]   = finished.get("point")
-
-    predict_data = fetch_predict()
-    session["last_predict"] = predict_data
-
-    kb   = AUTO_KB if auto_mode else PREDICT_KB
-    text = build_ui(session, predict_data)
-    msg  = await send_fn(text, kb)
-    session["message_id"] = msg.message_id
-    session["chat_id"]    = msg.chat_id
-
-    if context.job_queue:
-        context.job_queue.run_repeating(
-            predict_job,
-            interval=2,
-            first=2,
-            name=f"job_{uid}",
-            user_id=uid,
-        )
-
-# ===== CALLBACKS CHỌN GAME =====
-async def cb_game_betvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Thủ công: bấm vào → gửi dự đoán, user tự điều khiển."""
+async def cb_coming_soon(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
-    ensure_user(uid, uname)
+    await query.answer(
+        "🔒 Game sắp được ra mắt, vui lòng đợi!", show_alert=True
+    )
 
-    if not user_data[uid].get("key"):
-        await query.edit_message_text(
-            "❌ *Bạn chưa có KEY VIP!*\n\nMua key tại `🔑 MUA GÓI KEY`.",
-            parse_mode="Markdown"
-        )
-        return
-
-    await query.edit_message_text("✅ Đang khởi động BetVip (thủ công)...")
-
-    async def send_fn(text, kb):
-        return await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=text, reply_markup=kb, parse_mode="Markdown"
-        )
-
-    await _launch(uid, query.message.chat_id, context, send_fn, auto_mode=False)
-
-async def cb_game_betvip_auto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """AUTO: bot tự động gửi dự đoán mỗi phiên mới, không cần thao tác."""
+async def cb_select_betvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User chọn BetVip — hiện nút BẮT ĐẦU."""
     query = update.callback_query
     await query.answer()
     uid   = update.effective_user.id
@@ -400,69 +290,131 @@ async def cb_game_betvip_auto(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await query.edit_message_text(
-        "🤖 *AUTO DỰ ĐOÁN đã bật!*\n\n"
+        "⭐ *BETVIP*\n\n"
         "Bot sẽ tự động gửi dự đoán mỗi khi có kết quả mới.\n"
-        "Bấm *⏹ DỪNG AUTO DỰ ĐOÁN* để tắt."
-    , parse_mode="Markdown")
+        "Bấm *BẮT ĐẦU* để kích hoạt.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ BẮT ĐẦU DỰ ĐOÁN", callback_data="start_betvip")],
+            [InlineKeyboardButton("🔙 Quay lại",         callback_data="back_game_area")],
+        ])
+    )
 
-    async def send_fn(text, kb):
-        return await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=text, reply_markup=kb, parse_mode="Markdown"
-        )
+async def cb_back_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "🎮 *KHU VỰC GAME*\n\nChọn game bạn muốn dự đoán:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ BetVip",               callback_data="select_betvip")],
+            [InlineKeyboardButton("🔒 LC79 — Coming Soon",    callback_data="coming_soon")],
+            [InlineKeyboardButton("🔒 Max789 — Coming Soon",  callback_data="coming_soon")],
+            [InlineKeyboardButton("🔒 HitClub — Coming Soon", callback_data="coming_soon")],
+            [InlineKeyboardButton("🔙 Quay lại",             callback_data="back_main")],
+        ])
+    )
 
-    await _launch(uid, query.message.chat_id, context, send_fn, auto_mode=True)
-
-async def _switch_to_auto(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
-    """Chuyển từ thủ công sang AUTO trong cùng session."""
+# ===== BẮT ĐẦU DỰ ĐOÁN AUTO =====
+async def cb_start_betvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Bấm BẮT ĐẦU → kích hoạt auto ngay lập tức.
+    Bot gửi dự đoán đầu tiên, sau đó mỗi phiên mới tự động gửi tiếp.
+    """
+    query = update.callback_query
+    await query.answer()
+    uid   = update.effective_user.id
     uname = update.effective_user.username or ""
     ensure_user(uid, uname)
 
     if not user_data[uid].get("key"):
-        await update.message.reply_text(
-            "❌ *Bạn chưa có KEY VIP!*", parse_mode="Markdown"
+        await query.edit_message_text(
+            "❌ *Bạn chưa có KEY VIP!*\n\nMua key tại `🔑 MUA GÓI KEY`.",
+            parse_mode="Markdown"
         )
         return
 
-    # Cập nhật session hiện tại sang auto
-    session = user_sessions.get(uid)
-    if session:
-        session["auto_mode"] = True
+    # Dừng job cũ nếu còn
+    _cancel_job(context, uid)
+    _deactivate(uid)
 
-    await update.message.reply_text(
-        "🤖 *AUTO DỰ ĐOÁN đã bật!*\n\nBot sẽ tự động gửi dự đoán mỗi phiên mới.",
-        parse_mode="Markdown", reply_markup=AUTO_KB
+    # Khởi tạo session
+    chat_id = query.message.chat_id
+    session = {
+        "active":        True,
+        "chat_id":       chat_id,
+        "message_id":    None,
+        # Phiên trước (hiển thị UI)
+        "prev_session":  "---",
+        "prev_result":   "---",
+        "prev_dices":    None,
+        "prev_point":    None,
+        # Mốc theo dõi phiên game:
+        # known_latest = ID phiên cuối cùng đã có kết quả khi ta gửi dự đoán.
+        # Khi API game trả về phiên mới có ID > known_latest → gửi dự đoán mới.
+        "known_latest":  None,
+        "last_predict":  None,
+    }
+    user_sessions[uid] = session
+
+    # Snapshot trạng thái game hiện tại
+    game_sessions = fetch_game_sessions()
+    finished      = get_latest_finished(game_sessions) if game_sessions else None
+    if finished:
+        fid = finished.get("id")
+        session["known_latest"] = fid
+        session["prev_session"] = str(fid)
+        session["prev_result"]  = finished.get("resultTruyenThong") or "---"
+        session["prev_dices"]   = finished.get("dices")
+        session["prev_point"]   = finished.get("point")
+
+    # Fetch dự đoán đầu tiên và gửi ngay
+    predict_data         = fetch_predict()
+    session["last_predict"] = predict_data
+
+    await query.edit_message_text(
+        "🟢 *Auto dự đoán đã được kích hoạt!*\n\n"
+        "Bot sẽ tự động gửi dự đoán mỗi khi có kết quả mới.",
+        parse_mode="Markdown"
     )
 
-    # Nếu chưa có session (chưa chọn game) thì launch mới
-    if not session or not session["active"]:
-        async def send_fn(text, kb):
-            return await update.message.reply_text(
-                text, reply_markup=kb, parse_mode="Markdown"
-            )
-        await _launch(uid, update.message.chat_id, context, send_fn, auto_mode=True)
+    text = build_ui(session, predict_data)
+    msg  = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=PLAYING_KB,
+        parse_mode="Markdown"
+    )
+    session["message_id"] = msg.message_id
 
-# ===== PREDICT JOB =====
-async def predict_job(context: ContextTypes.DEFAULT_TYPE):
+    # Bắt đầu job poll mỗi 2 giây
+    if context.job_queue:
+        context.job_queue.run_repeating(
+            auto_job,
+            interval=2,
+            first=2,
+            name=f"job_{uid}",
+            user_id=uid,
+        )
+    log.info(f"uid={uid} BẮT ĐẦU auto, known_latest={session['known_latest']}")
+
+# ===== AUTO JOB =====
+async def auto_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Chạy mỗi 2 giây.
 
-    Thủ công (auto_mode=False):
-      - Cùng phiên → edit tin cũ (cập nhật giờ).
-      - Phiên mới  → edit tin cũ với dự đoán mới.
-
-    AUTO (auto_mode=True):
-      - Cùng phiên → edit tin cũ (cập nhật giờ).
-      - Phiên mới  → GỬI TIN MỚI hoàn toàn tự động.
+    Logic phát hiện phiên mới:
+      - Lấy danh sách phiên từ API game.
+      - Tìm phiên mới nhất đã có kết quả (resultTruyenThong != None).
+      - Nếu ID phiên đó > known_latest → phiên mới vừa ra kết quả.
+      - Cập nhật PHIÊN TRƯỚC, fetch dự đoán mới, GỬI TIN MỚI.
+      - Nếu cùng phiên → chỉ edit cập nhật đồng hồ.
     """
     uid     = context.job.user_id
     session = user_sessions.get(uid)
     if not session or not session["active"]:
         context.job.schedule_removal()
         return
-
-    auto_mode = session.get("auto_mode", False)
-    kb        = AUTO_KB if auto_mode else PREDICT_KB
 
     game_sessions = fetch_game_sessions()
     if not game_sessions:
@@ -472,77 +424,66 @@ async def predict_job(context: ContextTypes.DEFAULT_TYPE):
     if not finished:
         return
 
-    current_latest = finished.get("id")
-    known_latest   = session.get("known_latest")
+    current_id   = finished.get("id")
+    known_latest = session.get("known_latest")
 
-    is_new = (
-        current_latest is not None
+    # Phiên mới = ID lớn hơn (ID tăng dần theo thời gian)
+    is_new_session = (
+        current_id is not None
         and known_latest is not None
-        and current_latest != known_latest
+        and current_id != known_latest
     )
 
-    if is_new:
-        # Cập nhật phiên trước
-        session["prev_session"] = str(current_latest)
-        session["prev_result"]  = finished.get("resultTruyenThong") or "---"
-        session["prev_dices"]   = finished.get("dices")
-        session["prev_point"]   = finished.get("point")
-        session["known_latest"] = current_latest
+    if is_new_session:
+        log.info(f"uid={uid} phiên mới: {known_latest} → {current_id}")
 
-        # Fetch dự đoán mới
+        # Cập nhật PHIÊN TRƯỚC với kết quả thật vừa có
+        session["prev_session"]  = str(current_id)
+        session["prev_result"]   = finished.get("resultTruyenThong") or "---"
+        session["prev_dices"]    = finished.get("dices")
+        session["prev_point"]    = finished.get("point")
+        session["known_latest"]  = current_id
+
+        # Fetch dự đoán cho phiên tiếp theo
         predict_data = fetch_predict()
         if not predict_data or predict_data.get("status") == "TRAINING":
             session["last_predict"] = predict_data
-            log.info(f"uid={uid} phiên mới nhưng AI đang training, chờ...")
+            log.info(f"uid={uid} AI đang training, chờ phiên sau")
             return
 
         session["last_predict"] = predict_data
         text = build_ui(session, predict_data)
 
-        if auto_mode:
-            # AUTO: gửi tin MỚI hoàn toàn tự động
-            try:
-                msg = await context.bot.send_message(
-                    chat_id=session["chat_id"],
-                    text=text,
-                    reply_markup=kb,
-                    parse_mode="Markdown",
-                )
-                session["message_id"] = msg.message_id
-                log.info(f"uid={uid} AUTO gửi dự đoán phiên mới={current_latest}")
-            except Exception as e:
-                log.error(f"predict_job AUTO send lỗi uid={uid}: {e}")
-        else:
-            # Thủ công: edit tin cũ
-            try:
-                await context.bot.edit_message_text(
-                    text,
-                    chat_id=session["chat_id"],
-                    message_id=session["message_id"],
-                    reply_markup=kb,
-                    parse_mode="Markdown",
-                )
-                log.info(f"uid={uid} THỦ CÔNG edit dự đoán phiên mới={current_latest}")
-            except Exception as e:
-                if "not modified" not in str(e).lower():
-                    log.error(f"predict_job THỦ CÔNG edit lỗi uid={uid}: {e}")
+        # Gửi tin MỚI — user nhận notification tự động
+        try:
+            msg = await context.bot.send_message(
+                chat_id=session["chat_id"],
+                text=text,
+                reply_markup=PLAYING_KB,
+                parse_mode="Markdown",
+            )
+            session["message_id"] = msg.message_id
+            log.info(f"uid={uid} đã gửi dự đoán tự động cho phiên mới")
+        except Exception as e:
+            log.error(f"auto_job send lỗi uid={uid}: {e}")
 
     else:
-        # Cùng phiên — chỉ cập nhật giờ bằng edit
-        if known_latest is None and current_latest is not None:
-            session["known_latest"] = current_latest
+        # Cùng phiên — chỉ edit cập nhật đồng hồ, không gọi predict API
+        if known_latest is None and current_id is not None:
+            session["known_latest"] = current_id
+
         text = build_ui(session, session["last_predict"])
         try:
             await context.bot.edit_message_text(
                 text,
                 chat_id=session["chat_id"],
                 message_id=session["message_id"],
-                reply_markup=kb,
+                reply_markup=PLAYING_KB,
                 parse_mode="Markdown",
             )
         except Exception as e:
             if "not modified" not in str(e).lower():
-                log.error(f"predict_job edit lỗi uid={uid}: {e}")
+                log.error(f"auto_job edit lỗi uid={uid}: {e}")
 
 # ===== INLINE CALLBACKS =====
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -560,15 +501,11 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admin = is_admin(uid, uname)
     label = d.get("label")
 
-    if admin:
-        badge = "👑 *ADMIN — ĐẶC QUYỀN VÔ HẠN*"
-    elif label:
-        badge = f"🏷 *{label.upper()}*"
-    else:
-        badge = "👤 *HỒ SƠ CỦA BẠN*"
+    if admin:      badge = "👑 *ADMIN — ĐẶC QUYỀN VÔ HẠN*"
+    elif label:    badge = f"🏷 *{label.upper()}*"
+    else:          badge = "👤 *HỒ SƠ CỦA BẠN*"
 
     balance = "Không giới hạn" if admin else f"{d['balance']:,}đ"
-
     await update.message.reply_text(
         f"{badge}\n\n"
         f"🆔 ID: `{uid}`\n"
@@ -605,8 +542,7 @@ async def show_key_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def tan_thu_used_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Bạn đã sử dụng gói Tân Thủ rồi!", show_alert=True)
+    await update.callback_query.answer("Bạn đã sử dụng gói Tân Thủ rồi!", show_alert=True)
 
 async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -719,7 +655,6 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await query.edit_message_text("❌ Số tiền không hợp lệ.")
         return
-
     note   = f"KANO{random.randint(10000, 99999)}"
     qr_url = (
         f"https://img.vietqr.io/image/MB-0844551151-compact.png"
@@ -749,7 +684,7 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== LỆNH ADMIN: NẠP TIỀN =====
+# ===== ADMIN: NẠP TIỀN =====
 async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
     uname = update.effective_user.username or ""
@@ -759,8 +694,7 @@ async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
-            "📋 *Cú pháp:* `/naptien <user_id> <so_tien>`",
-            parse_mode="Markdown"
+            "📋 *Cú pháp:* `/naptien <user_id> <so_tien>`", parse_mode="Markdown"
         )
         return
     try:
@@ -771,18 +705,13 @@ async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if target_uid not in user_data:
         await update.message.reply_text(
-            f"❌ Không tìm thấy user ID `{target_uid}`.", parse_mode="Markdown"
+            f"❌ Không tìm thấy user `{target_uid}`.", parse_mode="Markdown"
         )
         return
     user_data[target_uid]["balance"] += amount
-    new_balance = user_data[target_uid]["balance"]
+    bal = user_data[target_uid]["balance"]
     await update.message.reply_text(
-        f"╔══════════════════════╗\n"
-        f"   ✅ *NẠP TIỀN THÀNH CÔNG*\n"
-        f"╚══════════════════════╝\n\n"
-        f"👤 User ID: `{target_uid}`\n"
-        f"💵 Nạp: *+{amount:,}đ*\n"
-        f"💰 Số dư mới: *{new_balance:,}đ*",
+        f"✅ Nạp *+{amount:,}đ* cho `{target_uid}`\nSố dư mới: *{bal:,}đ*",
         parse_mode="Markdown"
     )
     try:
@@ -793,14 +722,14 @@ async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"   🎉 *TÀI KHOẢN ĐƯỢC NẠP TIỀN*\n"
                 f"╚══════════════════════╝\n\n"
                 f"💵 Số tiền: *+{amount:,}đ*\n"
-                f"💰 Số dư hiện tại: *{new_balance:,}đ*\n\n"
-                f"✅ Giao dịch đã được xác nhận!\n"
+                f"💰 Số dư: *{bal:,}đ*\n\n"
+                f"✅ Giao dịch xác nhận thành công!\n"
                 f"Cảm ơn bạn đã nạp tiền vào Kano AI. 🙏"
             ),
             parse_mode="Markdown"
         )
     except Exception as e:
-        log.warning(f"Không thể gửi thông báo nạp tiền uid={target_uid}: {e}")
+        log.warning(f"Không gửi được thông báo nạp tiền uid={target_uid}: {e}")
 
 # ===== FEEDBACK & THÔNG BÁO =====
 async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -830,8 +759,10 @@ def main():
     app.add_handler(CommandHandler("naptien", cmd_naptien))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
-    app.add_handler(CallbackQueryHandler(cb_game_betvip,      pattern="^game_betvip$"))
-    app.add_handler(CallbackQueryHandler(cb_game_betvip_auto, pattern="^game_betvip_auto$"))
+    app.add_handler(CallbackQueryHandler(cb_select_betvip,    pattern="^select_betvip$"))
+    app.add_handler(CallbackQueryHandler(cb_start_betvip,     pattern="^start_betvip$"))
+    app.add_handler(CallbackQueryHandler(cb_coming_soon,      pattern="^coming_soon$"))
+    app.add_handler(CallbackQueryHandler(cb_back_game_area,   pattern="^back_game_area$"))
     app.add_handler(CallbackQueryHandler(back_main,           pattern="^back_main$"))
     app.add_handler(CallbackQueryHandler(buy_key,             pattern="^buykey_"))
     app.add_handler(CallbackQueryHandler(tan_thu_used_notice, pattern="^tan_thu_used$"))
@@ -840,7 +771,7 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
 
-    log.info("Bot Kano AI v9 đang chạy...")
+    log.info("Bot Kano AI đang chạy...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
