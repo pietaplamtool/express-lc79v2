@@ -10,7 +10,7 @@ from telegram.ext import (
 )
 
 # ── Cấu hình ──────────────────────────────────────────────────────────────────
-TOKEN = "8891039285:AAEDqy69JNgeQqqMo7q2yTAs4yUX6CP0eZ4"
+TOKEN = "8891039285:AAGZZCtyO9IvG1Q1E0QhgGvAmQd3Le3jFQc"
 KANO_API_URL = os.getenv("KANO_API_URL", "https://kano-ai-predictor.onrender.com")
 
 logging.basicConfig(
