@@ -1,778 +1,923 @@
-import requests
-import logging
-import random
-import string
-import threading
+"""
+app.py — Kano AI Prediction Engine v4
+Architecture : Claude
+Algorithm    : DeepSeek (modules 1-4)
+AI hẹp       : Claude pass 3 — GradientBoostEngine (module 5)
+API/Memory   : ChatGPT
+Deploy       : Gemini
+
+Thay đổi v4:
+  [+] GradientBoostEngine — scikit-learn GradientBoostingClassifier
+      · 18 features từ cửa sổ 20 kết quả
+      · Retrain background thread mỗi 50 updates, không block /predict
+      · Warmup 80 samples — trước đó engine trả (T, 0.5), MetaLearner bỏ qua
+      · RAM: model ~110 KB, scaler ~1 KB — an toàn với Render Free 512 MB
+      · Nếu import sklearn thất bại, GB bị vô hiệu hoá và 4 module cũ chạy như bình thường
+  [=] Modules 1-4 giữ nguyên từ pass 2 (đã fix bugs B, C, D)
+
+Dependency mới (requirements.txt):
+  scikit-learn>=1.3.0
+  numpy>=1.24.0
+"""
+
 import os
-from datetime import datetime
-from flask import Flask
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, MessageHandler, filters
+import math
+import time
+import json
+import logging
+import threading
+import urllib.request
+from collections import deque, defaultdict
+
+from flask import Flask, jsonify, request
+
+# ── Optional AI dependency ────────────────────────────────────────────────────
+try:
+    import numpy as np
+    from sklearn.ensemble import GradientBoostingClassifier
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    log_msg = "scikit-learn/numpy not found — GradientBoostEngine disabled."
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+try:
+    HISTORY_LIMIT = max(10, int(os.getenv("HISTORY_LIMIT", "500")))
+except ValueError:
+    HISTORY_LIMIT = 500
+
+STREAK_WINDOW   = 20
+FREQ_WINDOWS    = [10, 30, 50]
+MARKOV_ORDERS   = [1, 2, 3]
+FLIP_THRESHOLD  = 0.80
+EMA_ALPHA       = 0.1
+MIN_WEIGHT      = 0.05
+MAX_WEIGHT      = 0.60
+
+# GradientBoostEngine
+GB_FEATURE_WINDOW = 20    # cửa sổ feature
+GB_WARMUP         = 80    # min samples trước khi GB tham gia vote
+GB_MAX_SAMPLES    = 500   # số training samples tối đa giữ trong RAM
+GB_RETRAIN_EVERY  = 50    # retrain sau mỗi N updates
+
+LABELS = ("T", "X")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
 )
+log = logging.getLogger("kano")
+if not SKLEARN_AVAILABLE:
+    log.warning("scikit-learn/numpy not found — GradientBoostEngine disabled.")
 
-# ===== FLASK KEEPALIVE =====
-flask_app = Flask(__name__)
-BOT_URL   = os.environ.get("RENDER_EXTERNAL_URL", "")
 
-@flask_app.route("/")
-def health():
-    return "Kano AI Bot is running.", 200
+# ── Utility ───────────────────────────────────────────────────────────────────
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+def _entropy(counts: dict) -> float:
+    total = sum(counts.values())
+    if total == 0:
+        return 0.0
+    return -sum(
+        (c / total) * math.log2(c / total)
+        for c in counts.values()
+        if c > 0
+    )
 
-def self_ping():
-    import time as _t
-    _t.sleep(30)
-    while True:
-        try:
-            requests.get(BOT_URL or "https://bettv-telegram-bot.onrender.com", timeout=10)
-            log.info("Self-ping OK")
-        except Exception as e:
-            log.warning(f"Self-ping lỗi: {e}")
-        _t.sleep(600)
 
-# ===== CẤU HÌNH =====
-TOKEN         = "8891039285:AAGuzG0fdsycHSsIhogbth3dvnzE16PTziw"
-PREDICT_URL   = "https://bettv-predictor.onrender.com/predict"
-HISTORY_URL   = (
-    "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
-    "?cp=R&cl=R&pf=web&at=1fc7bfdeab18790088a6e44d6b8cb288&limit=10"
-)
-FEEDBACK_LINK = "https://t.me/feedbackkanoai_2026"
-THONGBAO_LINK = "https://t.me/thongbaokanoai_2026"
+def _clamp(val: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, val))
 
-ADMIN_IDS       = {7853432590}
-ADMIN_USERNAMES = {"thehpie9"}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+def _normalize_weights(weights: dict) -> dict:
+    total = sum(weights.values())
+    if total == 0:
+        n = len(weights)
+        return {k: 1.0 / n for k in weights}
+    return {k: v / total for k, v in weights.items()}
 
-# ===== BỘ NHỚ =====
-user_data     = {}
-user_sessions = {}
 
-# ===== KEYBOARDS =====
-MENU_KB = ReplyKeyboardMarkup([
-    ["🎮 KHU VỰC GAME",  "👤 HỒ SƠ"],
-    ["🔑 MUA GÓI KEY",   "✅ KÍCH HOẠT KEY"],
-    ["🎁 NHẬN GIFTCODE", "💰 NẠP TIỀN VÍ"],
-    ["📝 FEEDBACK",      "📢 KÊNH THÔNG BÁO"],
-], resize_keyboard=True)
-
-# Keyboard sau khi bắt đầu auto
-PLAYING_KB = ReplyKeyboardMarkup([
-    ["⏹ DỪNG DỰ ĐOÁN"],
-    ["🔙 QUAY LẠI MENU"],
-], resize_keyboard=True)
-
-WELCOME_TEXT = (
-    "🏆 *𝐓𝐎𝐎𝐋 𝐊𝐀𝐍𝐎 𝐀𝐈 — ĐẲNG CẤP DỰ ĐOÁN TÀI XỈU* 🏆\n\n"
-    "🎉 Chào mừng bạn đến với trợ lý AI dự đoán đỉnh cao nhất!\n\n"
-    "💥 *ĐẶC QUYỀN DÀNH CHO BẠN:*\n"
-    "⚡ Dự đoán chuẩn xác với công nghệ AI thế hệ mới.\n"
-    "⚡ Nạp tiền chớp mắt, hệ thống xử lý siêu tốc.\n"
-    "⚡ Menu tiện lợi, dễ dùng cho cả người mới.\n\n"
-    "🎁 Sẵn sàng chiến chưa? Chọn tính năng bên dưới!"
-)
-
-# ===== GÓI KEY =====
-KEY_PACKAGES = {
-    "tan_thu": {"name": "🎁 Tân Thủ Trải Nghiệm", "price": 0,       "duration": "2 ngày",  "one_time": True},
-    "1_ngay":  {"name": "1 Ngày",                  "price": 10_000,  "duration": "1 ngày",  "one_time": False},
-    "7_ngay":  {"name": "7 Ngày",                  "price": 50_000,  "duration": "7 ngày",  "one_time": False},
-    "30_ngay": {"name": "30 Ngày",                 "price": 150_000, "duration": "30 ngày", "one_time": False},
-    "90_ngay": {"name": "90 Ngày",                 "price": 350_000, "duration": "90 ngày", "one_time": False},
-}
-
-# ===== HELPERS =====
-def generate_key():
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=16))
-
-def is_admin(uid, username=""):
-    if uid in ADMIN_IDS:
-        return True
-    if username:
-        return username.lstrip("@").lower() in {u.lower() for u in ADMIN_USERNAMES}
-    return False
-
-def ensure_user(uid, username=""):
-    if uid not in user_data:
-        user_data[uid] = {
-            "balance": 0, "used": 0,
-            "key": None, "key_expiry": None,
-            "tan_thu_used": False, "label": None,
-        }
-    if is_admin(uid, username):
-        user_data[uid]["key"]        = "ADMIN_UNLIMITED"
-        user_data[uid]["key_expiry"] = "Vĩnh viễn"
-        if user_data[uid]["balance"] < 10_000_000:
-            user_data[uid]["balance"] = 10_000_000
-    # pie900k: quản lý, 100 triệu, KHÔNG có quyền admin
-    if uid == 8953969016 or (username and username.lstrip("@").lower() == "pie900k"):
-        if user_data[uid]["balance"] < 100_000_000:
-            user_data[uid]["balance"] = 100_000_000
-        user_data[uid]["label"] = "Quản lý"
-
-def _cancel_job(context, uid):
-    if context.job_queue:
-        for job in context.job_queue.get_jobs_by_name(f"job_{uid}"):
-            job.schedule_removal()
-
-def _deactivate(uid):
-    if uid in user_sessions:
-        user_sessions[uid]["active"] = False
-
-# ===== API =====
-def fetch_predict():
-    try:
-        r = requests.get(PREDICT_URL, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        c = float(data.get("confidence", 0))
-        data["confidence_pct"] = round(c * 100 if c <= 1.0 else c, 1)
-        return data
-    except Exception as e:
-        log.warning(f"fetch_predict lỗi: {e}")
+def _safe_label(value) -> str | None:
+    if value is None:
         return None
+    label = str(value).strip().upper()
+    return label if label in LABELS else None
 
-def fetch_game_sessions():
-    try:
-        r = requests.get(HISTORY_URL, timeout=8)
-        r.raise_for_status()
-        return r.json().get("list", [])
-    except Exception as e:
-        log.warning(f"fetch_game_sessions lỗi: {e}")
-        return []
 
-def get_latest_finished(sessions):
-    """Phiên mới nhất đã có kết quả thật (resultTruyenThong != None)."""
-    for s in sessions:
-        if s.get("resultTruyenThong"):
-            return s
-    return None
+# ── Module base ───────────────────────────────────────────────────────────────
 
-# ===== BUILD UI =====
-def label_result(raw):
-    if raw in ("TAI", "T", "TÀI"):   return "TÀI", "🔴"
-    if raw in ("XIU", "X", "XỈU"):   return "XỈU", "🔵"
-    return (raw or "---"), "➖"
+class _BaseModule:
+    name: str = "base"
 
-def build_ui(session, predict_data):
-    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    sep = "━" * 22
+    def predict(self, history: deque) -> tuple[str, float]:
+        if len(history) < self._min_history():
+            return "T", 0.5
+        label, conf = self._compute(history)
+        conf = _clamp(conf, 0.0, 1.0)
+        return label, conf
 
-    if predict_data and predict_data.get("status") == "PREDICT":
-        target_id              = str(predict_data["target_session_id"])
-        pred_label, pred_emoji = label_result(predict_data.get("predict", "").upper())
-        conf                   = predict_data["confidence_pct"]
-        is_ready               = True
-    else:
-        target_id  = "---"
-        pred_label = "Đang chờ dữ liệu"
-        pred_emoji = "⏳"
-        conf       = 0.0
-        is_ready   = False
+    def _min_history(self) -> int:
+        return 1
 
-    bar                    = "▰" * int(conf / 100 * 12) + "▱" * (12 - int(conf / 100 * 12))
-    prev_label, prev_emoji = label_result(session["prev_result"])
-    prev_dices             = session.get("prev_dices")
-    prev_point             = session.get("prev_point")
-    dice_line              = ""
-    if prev_dices and len(prev_dices) == 3:
-        dice_line = f"\n🎲 {prev_dices[0]} · {prev_dices[1]} · {prev_dices[2]}   Tổng: *{prev_point}*"
+    def _compute(self, history: deque) -> tuple[str, float]:
+        raise NotImplementedError
 
-    return (
-        f"╔══════════════════════╗\n"
-        f"      🏆 *KANO AI* · BetVip\n"
-        f"╚══════════════════════╝\n\n"
-        f"{sep}\n"
-        f"📡 *DỰ ĐOÁN PHIÊN TIẾP THEO*\n"
-        f"{sep}\n"
-        f"🔢 Phiên:   `#{target_id}`\n"
-        f"{pred_emoji} Kết quả:  *{pred_label}*\n\n"
-        f"📊 *ĐỘ TIN CẬY*\n"
-        f"`{bar}` *{conf:.1f}%*\n\n"
-        f"{sep}\n"
-        f"📜 *PHIÊN TRƯỚC*\n"
-        f"{sep}\n"
-        f"🔢 Phiên:   `#{session['prev_session']}`\n"
-        f"{prev_emoji} Kết quả:  *{prev_label}*"
-        f"{dice_line}\n\n"
-        f"{sep}\n"
-        f"🕒 {now}\n"
-        f"{'🟢 *AI ĐANG HOẠT ĐỘNG*' if is_ready else '🔴 *ĐANG CHỜ DỮ LIỆU*'}"
-    )
 
-# ===== /START =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
-    ensure_user(uid, uname)
-    await update.message.reply_text(WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KB)
+# ── Module 1: PatternEngine ───────────────────────────────────────────────────
 
-# ===== MENU ROUTER =====
-async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
-    ensure_user(uid, uname)
-    text  = update.message.text
-
-    if text == "⏹ DỪNG DỰ ĐOÁN":
-        _deactivate(uid)
-        _cancel_job(context, uid)
-        await update.message.reply_text(
-            "⏹ *Đã dừng dự đoán.*\n\nVào lại KHU VỰC GAME để tiếp tục.",
-            parse_mode="Markdown", reply_markup=MENU_KB
-        )
-        return
-
-    if text == "🔙 QUAY LẠI MENU":
-        _deactivate(uid)
-        _cancel_job(context, uid)
-        await update.message.reply_text(
-            WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KB
-        )
-        return
-
-    routes = {
-        "🎮 KHU VỰC GAME":   show_game_area,
-        "👤 HỒ SƠ":          show_profile,
-        "🔑 MUA GÓI KEY":    show_key_packages,
-        "✅ KÍCH HOẠT KEY":  activate_key_prompt,
-        "🎁 NHẬN GIFTCODE":  giftcode,
-        "💰 NẠP TIỀN VÍ":   show_nap_tien,
-        "📝 FEEDBACK":       feedback,
-        "📢 KÊNH THÔNG BÁO": thongbao,
-    }
-    fn = routes.get(text)
-    if fn:
-        await fn(update, context)
-    else:
-        await update.message.reply_text("⚠️ Vui lòng chọn chức năng từ menu bên dưới.")
-
-# ===== KHU VỰC GAME =====
-async def show_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎮 *KHU VỰC GAME*\n\nChọn game bạn muốn dự đoán:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ BetVip",               callback_data="select_betvip")],
-            [InlineKeyboardButton("🔒 LC79 — Coming Soon",    callback_data="coming_soon")],
-            [InlineKeyboardButton("🔒 Max789 — Coming Soon",  callback_data="coming_soon")],
-            [InlineKeyboardButton("🔒 HitClub — Coming Soon", callback_data="coming_soon")],
-            [InlineKeyboardButton("🔙 Quay lại",             callback_data="back_main")],
-        ])
-    )
-
-async def cb_coming_soon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer(
-        "🔒 Game sắp được ra mắt, vui lòng đợi!", show_alert=True
-    )
-
-async def cb_select_betvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User chọn BetVip — hiện nút BẮT ĐẦU."""
-    query = update.callback_query
-    await query.answer()
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
-    ensure_user(uid, uname)
-
-    if not user_data[uid].get("key"):
-        await query.edit_message_text(
-            "❌ *Bạn chưa có KEY VIP!*\n\nMua key tại `🔑 MUA GÓI KEY`.",
-            parse_mode="Markdown"
-        )
-        return
-
-    await query.edit_message_text(
-        "⭐ *BETVIP*\n\n"
-        "Bot sẽ tự động gửi dự đoán mỗi khi có kết quả mới.\n"
-        "Bấm *BẮT ĐẦU* để kích hoạt.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ BẮT ĐẦU DỰ ĐOÁN", callback_data="start_betvip")],
-            [InlineKeyboardButton("🔙 Quay lại",         callback_data="back_game_area")],
-        ])
-    )
-
-async def cb_back_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🎮 *KHU VỰC GAME*\n\nChọn game bạn muốn dự đoán:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ BetVip",               callback_data="select_betvip")],
-            [InlineKeyboardButton("🔒 LC79 — Coming Soon",    callback_data="coming_soon")],
-            [InlineKeyboardButton("🔒 Max789 — Coming Soon",  callback_data="coming_soon")],
-            [InlineKeyboardButton("🔒 HitClub — Coming Soon", callback_data="coming_soon")],
-            [InlineKeyboardButton("🔙 Quay lại",             callback_data="back_main")],
-        ])
-    )
-
-# ===== BẮT ĐẦU DỰ ĐOÁN AUTO =====
-async def cb_start_betvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+class PatternEngine(_BaseModule):
     """
-    Bấm BẮT ĐẦU → kích hoạt auto ngay lập tức.
-    Bot gửi dự đoán đầu tiên, sau đó mỗi phiên mới tự động gửi tiếp.
+    23 named pattern types. Each entry: (id, min_len, predicate, label_func).
+    Rarity = 1 - (frequency of pattern in full history).
+    Highest-rarity matching pattern wins.
     """
-    query = update.callback_query
-    await query.answer()
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
-    ensure_user(uid, uname)
+    name = "pattern"
 
-    if not user_data[uid].get("key"):
-        await query.edit_message_text(
-            "❌ *Bạn chưa có KEY VIP!*\n\nMua key tại `🔑 MUA GÓI KEY`.",
-            parse_mode="Markdown"
-        )
-        return
+    PATTERNS = [
+        ("alt_TX",      2, lambda t: t[-1] != t[-2] and t[-1] == "X", lambda t: t[-1]),
+        ("alt_XT",      2, lambda t: t[-1] != t[-2] and t[-1] == "T", lambda t: t[-1]),
+        ("TTT",         3, lambda t: t[-1] == t[-2] == t[-3] == "T",  lambda t: "X"),
+        ("XXX",         3, lambda t: t[-1] == t[-2] == t[-3] == "X",  lambda t: "T"),
+        ("T_X_T",       3, lambda t: t[-1] == "T" and t[-2] == "X" and t[-3] == "T", lambda t: "T"),
+        ("X_T_X",       3, lambda t: t[-1] == "X" and t[-2] == "T" and t[-3] == "X", lambda t: "X"),
+        ("TTTT",        4, lambda t: all(x == "T" for x in t[-4:]), lambda t: "X"),
+        ("XXXX",        4, lambda t: all(x == "X" for x in t[-4:]), lambda t: "T"),
+        ("T_T_X_X",     4, lambda t: t[-1] == t[-2] == "X" and t[-3] == t[-4] == "T", lambda t: "X"),
+        ("X_X_T_T",     4, lambda t: t[-1] == t[-2] == "T" and t[-3] == t[-4] == "X", lambda t: "T"),
+        ("T_X_X_T",     4, lambda t: t[-1] == "T" and t[-2] == t[-3] == "X" and t[-4] == "T", lambda t: "T"),
+        ("X_T_T_X",     4, lambda t: t[-1] == "X" and t[-2] == t[-3] == "T" and t[-4] == "X", lambda t: "X"),
+        ("T_T_X_T",     4, lambda t: t[-1] == "T" and t[-2] == "X" and t[-3] == "T" and t[-4] == "T", lambda t: "T"),
+        ("X_X_T_X",     4, lambda t: t[-1] == "X" and t[-2] == "T" and t[-3] == "X" and t[-4] == "X", lambda t: "X"),
+        ("T_T_T_X",     4, lambda t: t[-1] == "X" and t[-2] == t[-3] == t[-4] == "T", lambda t: "X"),
+        ("X_X_X_T",     4, lambda t: t[-1] == "T" and t[-2] == t[-3] == t[-4] == "X", lambda t: "T"),
+        ("T_X_T_X_b",   4, lambda t: t[-1] == "T" and t[-2] == "X" and t[-3] == "X" and t[-4] == "T", lambda t: "T"),
+        ("X_T_X_T_b",   4, lambda t: t[-1] == "X" and t[-2] == "T" and t[-3] == "T" and t[-4] == "X", lambda t: "X"),
+        ("T_X_T_X_T",   5, lambda t: t[-1]=="T" and t[-2]=="X" and t[-3]=="T" and t[-4]=="X" and t[-5]=="T", lambda t: "X"),
+        ("X_T_X_T_X",   5, lambda t: t[-1]=="X" and t[-2]=="T" and t[-3]=="X" and t[-4]=="T" and t[-5]=="X", lambda t: "T"),
+        ("T_T_X_T_X",   5, lambda t: t[-1]=="X" and t[-2]=="T" and t[-3]=="X" and t[-4]=="T" and t[-5]=="T", lambda t: "X"),
+        ("X_X_T_X_T",   5, lambda t: t[-1]=="T" and t[-2]=="X" and t[-3]=="T" and t[-4]=="X" and t[-5]=="X", lambda t: "T"),
+        ("pair_break",  6,
+            lambda t: t[-1] != t[-2] and t[-3] == t[-4] and t[-5] == t[-6] and t[-3] != t[-5],
+            lambda t: t[-1]),
+    ]
 
-    # Dừng job cũ nếu còn
-    _cancel_job(context, uid)
-    _deactivate(uid)
+    def _min_history(self) -> int:
+        return 2
 
-    # Khởi tạo session
-    chat_id = query.message.chat_id
-    session = {
-        "active":        True,
-        "chat_id":       chat_id,
-        "message_id":    None,
-        # Phiên trước (hiển thị UI)
-        "prev_session":  "---",
-        "prev_result":   "---",
-        "prev_dices":    None,
-        "prev_point":    None,
-        # Mốc theo dõi phiên game:
-        # known_latest = ID phiên cuối cùng đã có kết quả khi ta gửi dự đoán.
-        # Khi API game trả về phiên mới có ID > known_latest → gửi dự đoán mới.
-        "known_latest":  None,
-        "last_predict":  None,
-    }
-    user_sessions[uid] = session
+    def _compute(self, history: deque) -> tuple[str, float]:
+        hist_list = list(history)
+        tail_len = len(hist_list)
+        matched = []
+        for pname, min_len, pred, label_func in self.PATTERNS:
+            if tail_len < min_len:
+                continue
+            if not pred(hist_list):
+                continue
+            count = 0
+            total_windows = max(0, tail_len - min_len + 1)
+            for i in range(total_windows):
+                window = hist_list[i: i + min_len]
+                if pred(window):
+                    count += 1
+            rarity = 1.0 - (count / total_windows) if total_windows > 0 else 1.0
+            matched.append((pname, label_func(hist_list), _clamp(rarity, 0.0, 1.0)))
+        if not matched:
+            return "T", 0.5
+        best = max(matched, key=lambda x: x[2])
+        return best[1], best[2]
 
-    # Snapshot trạng thái game hiện tại
-    game_sessions = fetch_game_sessions()
-    finished      = get_latest_finished(game_sessions) if game_sessions else None
-    if finished:
-        fid = finished.get("id")
-        session["known_latest"] = fid
-        session["prev_session"] = str(fid)
-        session["prev_result"]  = finished.get("resultTruyenThong") or "---"
-        session["prev_dices"]   = finished.get("dices")
-        session["prev_point"]   = finished.get("point")
 
-    # Fetch dự đoán đầu tiên và gửi ngay
-    predict_data         = fetch_predict()
-    session["last_predict"] = predict_data
+# ── Module 2: MarkovEngine ────────────────────────────────────────────────────
 
-    await query.edit_message_text(
-        "🟢 *Auto dự đoán đã được kích hoạt!*\n\n"
-        "Bot sẽ tự động gửi dự đoán mỗi khi có kết quả mới.",
-        parse_mode="Markdown"
-    )
-
-    text = build_ui(session, predict_data)
-    msg  = await context.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        reply_markup=PLAYING_KB,
-        parse_mode="Markdown"
-    )
-    session["message_id"] = msg.message_id
-
-    # Bắt đầu job poll mỗi 2 giây
-    if context.job_queue:
-        context.job_queue.run_repeating(
-            auto_job,
-            interval=2,
-            first=2,
-            name=f"job_{uid}",
-            user_id=uid,
-        )
-    log.info(f"uid={uid} BẮT ĐẦU auto, known_latest={session['known_latest']}")
-
-# ===== AUTO JOB =====
-async def auto_job(context: ContextTypes.DEFAULT_TYPE):
+class MarkovEngine(_BaseModule):
     """
-    Chạy mỗi 2 giây.
-
-    Logic phát hiện phiên mới:
-      - Lấy danh sách phiên từ API game.
-      - Tìm phiên mới nhất đã có kết quả (resultTruyenThong != None).
-      - Nếu ID phiên đó > known_latest → phiên mới vừa ra kết quả.
-      - Cập nhật PHIÊN TRƯỚC, fetch dự đoán mới, GỬI TIN MỚI.
-      - Nếu cùng phiên → chỉ edit cập nhật đồng hồ.
+    Orders 1-3 maintained simultaneously.
+    Score = log(count+1) * confidence / sqrt(order) — higher orders compete fairly.
+    Laplace smoothing k=1.
     """
-    uid     = context.job.user_id
-    session = user_sessions.get(uid)
-    if not session or not session["active"]:
-        context.job.schedule_removal()
-        return
+    name = "markov"
 
-    game_sessions = fetch_game_sessions()
-    if not game_sessions:
-        return
+    def __init__(self):
+        self._tables: dict[int, dict] = {
+            o: defaultdict(lambda: defaultdict(int))
+            for o in MARKOV_ORDERS
+        }
 
-    finished = get_latest_finished(game_sessions)
-    if not finished:
-        return
+    def train(self, history: list[str]) -> None:
+        for i in range(len(history)):
+            for order in MARKOV_ORDERS:
+                if i < order:
+                    continue
+                state = tuple(history[i - order: i])
+                self._tables[order][state][history[i]] += 1
 
-    current_id   = finished.get("id")
-    known_latest = session.get("known_latest")
+    def update(self, label: str, history: deque) -> None:
+        lst = list(history)
+        for order in MARKOV_ORDERS:
+            if len(lst) <= order:
+                continue
+            state = tuple(lst[-(order + 1): -1])
+            self._tables[order][state][label] += 1
 
-    # Phiên mới = ID lớn hơn (ID tăng dần theo thời gian)
-    is_new_session = (
-        current_id is not None
-        and known_latest is not None
-        and current_id != known_latest
-    )
+    def _min_history(self) -> int:
+        return max(MARKOV_ORDERS)
 
-    if is_new_session:
-        log.info(f"uid={uid} phiên mới: {known_latest} → {current_id}")
+    def _compute(self, history: deque) -> tuple[str, float]:
+        hist_list = list(history)
+        best_score = -1.0
+        best_probs: dict[str, float] = {}
+        for order in MARKOV_ORDERS:
+            if len(hist_list) < order:
+                continue
+            state = tuple(hist_list[-order:])
+            counts = self._tables[order][state]
+            total_counts = sum(counts.values())
+            if total_counts == 0:
+                continue
+            smoothed_total = total_counts + 2
+            prob_T = (counts.get("T", 0) + 1) / smoothed_total
+            prob_X = (counts.get("X", 0) + 1) / smoothed_total
+            confidence = max(prob_T, prob_X)
+            score = math.log(total_counts + 1) * confidence / math.sqrt(order)
+            if score > best_score:
+                best_score = score
+                best_probs = {"T": prob_T, "X": prob_X}
+        if not best_probs:
+            return "T", 0.5
+        if best_probs["T"] >= best_probs["X"]:
+            return "T", best_probs["T"]
+        return "X", best_probs["X"]
 
-        # Cập nhật PHIÊN TRƯỚC với kết quả thật vừa có
-        session["prev_session"]  = str(current_id)
-        session["prev_result"]   = finished.get("resultTruyenThong") or "---"
-        session["prev_dices"]    = finished.get("dices")
-        session["prev_point"]    = finished.get("point")
-        session["known_latest"]  = current_id
 
-        # Fetch dự đoán cho phiên tiếp theo
-        predict_data = fetch_predict()
-        if not predict_data or predict_data.get("status") == "TRAINING":
-            session["last_predict"] = predict_data
-            log.info(f"uid={uid} AI đang training, chờ phiên sau")
-            return
+# ── Module 3: StreakEngine ────────────────────────────────────────────────────
 
-        session["last_predict"] = predict_data
-        text = build_ui(session, predict_data)
+class StreakEngine(_BaseModule):
+    """
+    streak_ratio = dominant_count / window, rescaled (ratio-0.5)*2 → [0,1].
+    High ratio = long streak = high break probability.
+    Không dùng entropy — entropy binary luôn gần 1.0 trên dữ liệu ngẫu nhiên.
+    """
+    name = "streak"
 
-        # Gửi tin MỚI — user nhận notification tự động
-        try:
-            msg = await context.bot.send_message(
-                chat_id=session["chat_id"],
-                text=text,
-                reply_markup=PLAYING_KB,
-                parse_mode="Markdown",
-            )
-            session["message_id"] = msg.message_id
-            log.info(f"uid={uid} đã gửi dự đoán tự động cho phiên mới")
-        except Exception as e:
-            log.error(f"auto_job send lỗi uid={uid}: {e}")
+    def _min_history(self) -> int:
+        return STREAK_WINDOW
 
-    else:
-        # Cùng phiên — chỉ edit cập nhật đồng hồ, không gọi predict API
-        if known_latest is None and current_id is not None:
-            session["known_latest"] = current_id
-
-        text = build_ui(session, session["last_predict"])
-        try:
-            await context.bot.edit_message_text(
-                text,
-                chat_id=session["chat_id"],
-                message_id=session["message_id"],
-                reply_markup=PLAYING_KB,
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            if "not modified" not in str(e).lower():
-                log.error(f"auto_job edit lỗi uid={uid}: {e}")
-
-# ===== INLINE CALLBACKS =====
-async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(WELCOME_TEXT, parse_mode="Markdown")
-
-# ===== HỒ SƠ =====
-async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user  = update.effective_user
-    uid   = user.id
-    uname = user.username or ""
-    ensure_user(uid, uname)
-    d     = user_data[uid]
-    admin = is_admin(uid, uname)
-    label = d.get("label")
-
-    if admin:      badge = "👑 *ADMIN — ĐẶC QUYỀN VÔ HẠN*"
-    elif label:    badge = f"🏷 *{label.upper()}*"
-    else:          badge = "👤 *HỒ SƠ CỦA BẠN*"
-
-    balance = "Không giới hạn" if admin else f"{d['balance']:,}đ"
-    await update.message.reply_text(
-        f"{badge}\n\n"
-        f"🆔 ID: `{uid}`\n"
-        f"👤 Tên: {user.first_name}\n"
-        f"🔗 Username: @{uname or 'Chưa có'}\n"
-        f"💰 Số dư: {balance}\n"
-        f"💸 Đã dùng: {d.get('used', 0):,}đ\n"
-        f"🔑 KEY VIP: `{d.get('key') or 'Chưa có'}`\n"
-        f"⏰ Hạn key: {d.get('key_expiry') or 'Chưa có'}",
-        parse_mode="Markdown"
-    )
-
-# ===== MUA KEY =====
-async def show_key_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
-    ensure_user(uid, uname)
-    rows  = []
-    for k, p in KEY_PACKAGES.items():
-        if p.get("one_time") and user_data[uid].get("tan_thu_used"):
-            rows.append([InlineKeyboardButton(
-                f"{p['name']} — Đã dùng ✗", callback_data="tan_thu_used"
-            )])
+    def _compute(self, history: deque) -> tuple[str, float]:
+        window = list(history)[-STREAK_WINDOW:]
+        counts = {label: window.count(label) for label in LABELS}
+        dominant_count = max(counts.values())
+        streak_ratio = dominant_count / STREAK_WINDOW
+        break_prob = _clamp((streak_ratio - 0.5) * 2.0, 0.0, 1.0)
+        last_label = window[-1]
+        if break_prob > 0.5:
+            pred = "X" if last_label == "T" else "T"
+            conf = break_prob
         else:
-            price_str = "FREE" if p["price"] == 0 else f"{p['price']:,}đ"
-            rows.append([InlineKeyboardButton(
-                f"{p['name']} — {price_str}", callback_data=f"buykey_{k}"
-            )])
-    rows.append([InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")])
-    await update.message.reply_text(
-        "🔑 *MUA GÓI KEY VIP*\n\nChọn gói phù hợp:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(rows)
-    )
+            pred = last_label
+            conf = 0.5 + (0.5 - break_prob) * 0.4
+        return pred, _clamp(conf, 0.0, 1.0)
 
-async def tan_thu_used_notice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer("Bạn đã sử dụng gói Tân Thủ rồi!", show_alert=True)
 
-async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
-    ensure_user(uid, uname)
+# ── Module 4: FrequencyEngine ─────────────────────────────────────────────────
 
-    pkg_k = query.data.replace("buykey_", "")
-    pkg   = KEY_PACKAGES.get(pkg_k)
-    if not pkg:
-        await query.edit_message_text("❌ Gói key không hợp lệ.")
-        return
+class FrequencyEngine(_BaseModule):
+    """
+    Windows 10/30/50. Reversion wins over momentum when |short-long| > 0.20.
+    """
+    name = "frequency"
+    REVERSION_THRESHOLD = 0.20
 
-    admin = is_admin(uid, uname)
+    def _min_history(self) -> int:
+        return max(FREQ_WINDOWS)
 
-    if pkg.get("one_time") and user_data[uid].get("tan_thu_used") and not admin:
-        await query.answer("Bạn đã sử dụng gói Tân Thủ rồi!", show_alert=True)
-        return
+    def _compute(self, history: deque) -> tuple[str, float]:
+        hist_list = list(history)
+        ratios: dict[int, float] = {}
+        for w in FREQ_WINDOWS:
+            ratios[w] = hist_list[-w:].count("T") / w if len(hist_list) >= w else 0.5
+        short, mid, long = ratios[10], ratios[30], ratios[50]
+        momentum_label = None
+        if short > mid > long:
+            momentum_label = "T"
+        elif short < mid < long:
+            momentum_label = "X"
+        reversion_label = None
+        if abs(short - long) > self.REVERSION_THRESHOLD:
+            reversion_label = "X" if short > long else "T"
+        pred = (reversion_label if reversion_label is not None
+                else (momentum_label if momentum_label is not None
+                      else hist_list[-1]))
+        conf = abs(short - 0.5) * 2.0
+        return pred, _clamp(conf, 0.0, 1.0)
 
-    if not admin and pkg["price"] > 0:
-        if user_data[uid]["balance"] < pkg["price"]:
-            await query.answer(
-                f"Số dư không đủ! Cần {pkg['price']:,}đ, hiện có {user_data[uid]['balance']:,}đ.",
-                show_alert=True
-            )
+
+# ── Module 5: GradientBoostEngine ────────────────────────────────────────────
+
+class GradientBoostEngine:
+    """
+    AI hẹp thực sự — scikit-learn GradientBoostingClassifier.
+
+    Kiến trúc:
+    - 18 features từ cửa sổ GB_FEATURE_WINDOW (=20) kết quả gần nhất.
+    - Retrain nền mỗi GB_RETRAIN_EVERY (=50) updates, không block /predict.
+    - Model mới được swap vào sau khi retrain xong (atomic).
+    - Warmup GB_WARMUP (=80) samples — trước đó predict() trả (T, 0.5).
+    - RAM: model ≈ 110 KB, buffer 500×18 float64 ≈ 70 KB. Tổng < 1 MB.
+
+    18 features:
+      0  ratio_full     — T-ratio toàn window 20
+      1  ratio_5        — T-ratio 5 kết quả cuối
+      2  ratio_10       — T-ratio 10 kết quả cuối
+      3  ratio_15       — T-ratio 15 kết quả cuối
+      4  streak_norm    — độ dài streak / window
+      5  switch_rate    — tần suất đổi chiều trong window
+      6  momentum_5_15  — ratio_5 - ratio_15 (xu hướng ngắn vs dài)
+      7  momentum_10_15 — ratio_10 - ratio_15
+      8  entropy        — Shannon entropy nhị phân của window
+      9  last1          — kết quả -1 (binary)
+      10 last2          — kết quả -2
+      11 last3          — kết quả -3
+      12 p_tx           — P(X | prev=T) trong window
+      13 p_xt           — P(T | prev=X) trong window
+      14 double_end     — 1 nếu 2 kết quả cuối giống nhau
+      15 triple_end     — 1 nếu 3 kết quả cuối giống nhau
+      16 alt_end        — 1 nếu 4 kết quả cuối xen kẽ hoàn toàn
+      17 current        — kết quả cuối (binary)
+    """
+
+    name = "gb"
+
+    def __init__(self):
+        self._enabled = SKLEARN_AVAILABLE
+        if not self._enabled:
             return
-        user_data[uid]["balance"] -= pkg["price"]
-        user_data[uid]["used"]    += pkg["price"]
 
-    if pkg.get("one_time") and not admin:
-        user_data[uid]["tan_thu_used"] = True
+        self._lock         = threading.Lock()
+        self._model        = None   # GradientBoostingClassifier | None
+        self._scaler       = None   # StandardScaler | None
+        self._X_buf: list  = []     # feature buffer
+        self._y_buf: list  = []     # label buffer
+        self._update_count = 0      # số updates kể từ retrain cuối
+        self._ready        = False  # True sau warmup + lần retrain đầu tiên
+        self._retrain_thread: threading.Thread | None = None
 
-    new_key  = "ADMIN_UNLIMITED" if admin else generate_key()
-    duration = "Vĩnh viễn"       if admin else pkg["duration"]
-    user_data[uid]["key"]        = new_key
-    user_data[uid]["key_expiry"] = duration
+    # ── Feature engineering ───────────────────────────────────────────────
 
-    price_str     = "Miễn phí" if pkg["price"] == 0 else f"{pkg['price']:,}đ"
-    one_time_note = "\n⚠️ *Gói này chỉ dùng được 1 lần.*" if pkg.get("one_time") and not admin else ""
+    @staticmethod
+    def _build_features(history: list[str]) -> list[float]:
+        w = history[-GB_FEATURE_WINDOW:] if len(history) >= GB_FEATURE_WINDOW else history
+        n = len(w)
+        nums = [1 if x == "T" else 0 for x in w]
 
-    await query.edit_message_text(
-        f"╔══════════════════════╗\n"
-        f"   💎 *GIAO DỊCH THÀNH CÔNG*\n"
-        f"╚══════════════════════╝\n\n"
-        f"📦 Gói: *{pkg['name']}*\n"
-        f"🔑 Key: `{new_key}`\n"
-        f"⏰ Hạn: *{duration}*\n"
-        f"💰 Chi phí: *{price_str}*"
-        f"{one_time_note}\n\n"
-        f"Dùng lệnh `/active {new_key}` để kích hoạt.",
-        parse_mode="Markdown"
-    )
+        ratio_full = sum(nums) / n
+        ratio_5    = sum(nums[-5:])  / min(n, 5)
+        ratio_10   = sum(nums[-10:]) / min(n, 10)
+        ratio_15   = sum(nums[-15:]) / min(n, 15)
 
-# ===== KÍCH HOẠT KEY =====
-async def activate_key_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ *KÍCH HOẠT KEY*\n\nNhập lệnh:\n`/active KEY_CUA_BAN`",
-        parse_mode="Markdown"
-    )
+        current = nums[-1]
+        streak = 0
+        for v in reversed(nums):
+            if v == current:
+                streak += 1
+            else:
+                break
+        streak_norm = streak / n
 
-async def cmd_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid  = update.effective_user.id
-    args = context.args
-    if not args:
-        await update.message.reply_text("❌ Cú pháp: `/active KEY_CUA_BAN`", parse_mode="Markdown")
+        switches = sum(1 for i in range(1, n) if nums[i] != nums[i - 1])
+        switch_rate = switches / max(n - 1, 1)
+
+        momentum_5_15  = ratio_5  - ratio_15
+        momentum_10_15 = ratio_10 - ratio_15
+
+        p = ratio_full
+        entropy = -(p * math.log2(p) + (1 - p) * math.log2(1 - p)) if 0 < p < 1 else 0.0
+
+        last1 = nums[-1] if n >= 1 else 0.5
+        last2 = nums[-2] if n >= 2 else 0.5
+        last3 = nums[-3] if n >= 3 else 0.5
+
+        tt = tx = xt = xx = 0
+        for i in range(1, n):
+            if   nums[i - 1] == 1 and nums[i] == 1: tt += 1
+            elif nums[i - 1] == 1 and nums[i] == 0: tx += 1
+            elif nums[i - 1] == 0 and nums[i] == 1: xt += 1
+            else:                                     xx += 1
+
+        p_tx = tx / max(tt + tx, 1)
+        p_xt = xt / max(xt + xx, 1)
+
+        double_end = 1 if n >= 2 and nums[-1] == nums[-2] else 0
+        triple_end = 1 if n >= 3 and nums[-1] == nums[-2] == nums[-3] else 0
+        alt_end    = 1 if (n >= 4 and nums[-1] != nums[-2]
+                           and nums[-2] != nums[-3] and nums[-3] != nums[-4]) else 0
+
+        return [
+            ratio_full, ratio_5, ratio_10, ratio_15,
+            streak_norm, switch_rate,
+            momentum_5_15, momentum_10_15,
+            entropy,
+            last1, last2, last3,
+            p_tx, p_xt,
+            double_end, triple_end, alt_end,
+            current,
+        ]
+
+    # ── Predict ───────────────────────────────────────────────────────────
+
+    def predict(self, history: deque) -> tuple[str, float]:
+        if not self._enabled or not self._ready:
+            return "T", 0.5
+        hist_list = list(history)
+        if len(hist_list) < GB_FEATURE_WINDOW:
+            return "T", 0.5
+        feats = self._build_features(hist_list)
+        with self._lock:
+            model, scaler = self._model, self._scaler
+        if model is None or scaler is None:
+            return "T", 0.5
+        try:
+            X = np.array(feats, dtype=np.float64).reshape(1, -1)
+            X_s = scaler.transform(X)
+            proba = model.predict_proba(X_s)[0]  # [P(X), P(T)]
+            # class ordering: 0=X, 1=T (sklearn sorts classes numerically: 0<1)
+            p_t = float(proba[1])
+            p_x = float(proba[0])
+            if p_t >= p_x:
+                return "T", _clamp(p_t, 0.0, 1.0)
+            return "X", _clamp(p_x, 0.0, 1.0)
+        except Exception as exc:
+            log.warning("GradientBoostEngine.predict error: %s", exc)
+            return "T", 0.5
+
+    # ── Update (called after each confirmed result) ───────────────────────
+
+    def add_sample(self, history: list[str], true_label: str) -> None:
+        """Buffer one sample, trigger retrain when threshold reached."""
+        if not self._enabled:
+            return
+        if len(history) < GB_FEATURE_WINDOW:
+            return
+        feats = self._build_features(history)
+        y = 1 if true_label == "T" else 0
+        with self._lock:
+            self._X_buf.append(feats)
+            self._y_buf.append(y)
+            if len(self._X_buf) > GB_MAX_SAMPLES:
+                self._X_buf.pop(0)
+                self._y_buf.pop(0)
+            buf_len = len(self._X_buf)
+            self._update_count += 1
+            should_retrain = (
+                self._update_count >= GB_RETRAIN_EVERY
+                and buf_len >= GB_WARMUP
+                and (self._retrain_thread is None
+                     or not self._retrain_thread.is_alive())
+            )
+            if should_retrain:
+                X_snap = list(self._X_buf)
+                y_snap = list(self._y_buf)
+                self._update_count = 0
+
+        if should_retrain:
+            self._retrain_thread = threading.Thread(
+                target=self._retrain,
+                args=(X_snap, y_snap),
+                daemon=True,
+                name="kano-gb-retrain",
+            )
+            self._retrain_thread.start()
+
+    def _retrain(self, X_snap: list, y_snap: list) -> None:
+        """Background retrain. Swaps model atomically when done."""
+        try:
+            X = np.array(X_snap, dtype=np.float64)
+            y = np.array(y_snap, dtype=np.int32)
+            scaler = StandardScaler()
+            X_s = scaler.fit_transform(X)
+            model = GradientBoostingClassifier(
+                n_estimators=80,
+                max_depth=3,
+                learning_rate=0.1,
+                subsample=0.8,
+                random_state=42,
+            )
+            model.fit(X_s, y)
+            with self._lock:
+                self._model  = model
+                self._scaler = scaler
+                self._ready  = True
+            log.info(
+                "GradientBoostEngine retrained on %d samples. Ready=%s",
+                len(X_snap),
+                self._ready,
+            )
+        except Exception as exc:
+            log.error("GradientBoostEngine retrain failed: %s", exc)
+
+    def bulk_train(self, history: list[str]) -> None:
+        """Called once on startup from load_history."""
+        if not self._enabled or len(history) < GB_WARMUP:
+            return
+        X_buf, y_buf = [], []
+        for i in range(GB_FEATURE_WINDOW, len(history)):
+            feats = self._build_features(history[:i])
+            label = 1 if history[i] == "T" else 0
+            X_buf.append(feats)
+            y_buf.append(label)
+            if len(X_buf) > GB_MAX_SAMPLES:
+                X_buf.pop(0)
+                y_buf.pop(0)
+        with self._lock:
+            self._X_buf = X_buf
+            self._y_buf = y_buf
+            self._update_count = 0
+        # Retrain inline on startup (blocking, before first request)
+        self._retrain(X_buf, y_buf)
+
+    @property
+    def is_ready(self) -> bool:
+        return self._enabled and self._ready
+
+    def status(self) -> dict:
+        if not self._enabled:
+            return {"enabled": False, "reason": "scikit-learn not installed"}
+        with self._lock:
+            return {
+                "enabled":       True,
+                "ready":         self._ready,
+                "buffer_size":   len(self._X_buf),
+                "warmup_needed": max(0, GB_WARMUP - len(self._X_buf)),
+                "updates_since_retrain": self._update_count,
+            }
+
+
+# ── Module 6: MetaLearner ─────────────────────────────────────────────────────
+
+class MetaLearner:
+    """
+    EMA-weighted voting. Số module = 4 hoặc 5 tuỳ sklearn availability.
+
+    Contrarian flip: raw_winning > FLIP_THRESHOLD (tuyệt đối, không tương đối).
+    Điều này ngăn low-confidence unanimous votes kích flip.
+      conf=0.55, 5 modules đồng thuận → raw_winning=0.55 < 0.80 → không flip.
+      conf=0.95, 5 modules đồng thuận → raw_winning=0.95 > 0.80 → flip.
+    """
+
+    def __init__(self, module_names: list[str]):
+        n = len(module_names)
+        self.weights: dict[str, float] = {name: 1.0 / n for name in module_names}
+
+    def vote(self, signals: dict[str, tuple[str, float]]) -> tuple[str, float]:
+        weighted_T = 0.0
+        weighted_X = 0.0
+        for name, (label, conf) in signals.items():
+            w = self.weights.get(name, 0.0)
+            if label == "T":
+                weighted_T += w * conf
+            else:
+                weighted_X += w * conf
+        total = weighted_T + weighted_X
+        if total == 0:
+            return "T", 0.5
+        prob_T = weighted_T / total
+        prob_X = weighted_X / total
+        if prob_T >= prob_X:
+            label, score, raw_winning = "T", prob_T, weighted_T
+        else:
+            label, score, raw_winning = "X", prob_X, weighted_X
+        if raw_winning > FLIP_THRESHOLD:
+            label = "X" if label == "T" else "T"
+        return label, _clamp(score, 0.0, 1.0)
+
+    def adjust_weights(
+        self,
+        signals: dict[str, tuple[str, float]],
+        true_label: str,
+    ) -> None:
+        for name, (pred_label, _) in signals.items():
+            w = self.weights.get(name, 0.0)
+            if pred_label == true_label:
+                w += EMA_ALPHA * (MAX_WEIGHT - w)
+            else:
+                w -= EMA_ALPHA * (w - MIN_WEIGHT)
+            self.weights[name] = _clamp(w, MIN_WEIGHT, MAX_WEIGHT)
+        self.weights = _normalize_weights(self.weights)
+
+
+# ── Core predictor ────────────────────────────────────────────────────────────
+
+class KanoPredictor:
+    def __init__(self):
+        self.history: deque[str] = deque(maxlen=HISTORY_LIMIT)
+        self._session_id: str | None = None
+        self._lock = threading.RLock()
+
+        self.pattern   = PatternEngine()
+        self.markov    = MarkovEngine()
+        self.streak    = StreakEngine()
+        self.frequency = FrequencyEngine()
+        self.gb        = GradientBoostEngine()
+
+        module_names = [
+            self.pattern.name,
+            self.markov.name,
+            self.streak.name,
+            self.frequency.name,
+            self.gb.name,
+        ]
+        self.meta = MetaLearner(module_names)
+
+        self._total_predictions   = 0
+        self._correct_predictions = 0
+        self._last_predict: dict | None = None
+        self._startup_time = time.time()
+
+        log.info(
+            "KanoPredictor initialised. HISTORY_LIMIT=%d sklearn=%s",
+            HISTORY_LIMIT,
+            SKLEARN_AVAILABLE,
+        )
+
+    def load_history(self, results: list[str]) -> None:
+        cleaned = [_safe_label(x) for x in results]
+        cleaned = [x for x in cleaned if x is not None]
+        trimmed = cleaned[-HISTORY_LIMIT:]
+        with self._lock:
+            self.history.clear()
+            self.history.extend(trimmed)
+            self.markov = MarkovEngine()
+            self.markov.train(trimmed)
+        # GB bulk train runs outside lock (blocking, ~0.1s)
+        self.gb.bulk_train(trimmed)
+        log.info("Loaded %d historical results. GB ready=%s", len(trimmed), self.gb.is_ready)
+
+    def predict(self) -> dict:
+        with self._lock:
+            if len(self.history) < 3:
+                return {
+                    "label":        "T",
+                    "confidence":   0.50,
+                    "reason":       "Chưa đủ lịch sử",
+                    "module_votes": {},
+                    "weights":      dict(self.meta.weights),
+                    "history_len":  len(self.history),
+                    "gb_ready":     self.gb.is_ready,
+                }
+            signals = {
+                self.pattern.name:   self.pattern.predict(self.history),
+                self.markov.name:    self.markov.predict(self.history),
+                self.streak.name:    self.streak.predict(self.history),
+                self.frequency.name: self.frequency.predict(self.history),
+                self.gb.name:        self.gb.predict(self.history),
+            }
+            label, conf = self.meta.vote(signals)
+            self._total_predictions += 1
+            result = {
+                "label":      label,
+                "confidence": round(conf, 4),
+                "reason":     self._build_reason(signals, label),
+                "module_votes": {
+                    k: {"label": v[0], "confidence": round(v[1], 4)}
+                    for k, v in signals.items()
+                },
+                "weights": {
+                    k: round(v, 4) for k, v in self.meta.weights.items()
+                },
+                "history_len": len(self.history),
+                "gb_ready":    self.gb.is_ready,
+            }
+            self._last_predict = result
+            return result
+
+    def update(self, true_label: str, session_id: str | None = None) -> None:
+        true_label = _safe_label(true_label)
+        if true_label is None:
+            log.warning("Invalid label ignored.")
+            return
+        with self._lock:
+            if self._last_predict:
+                if self._last_predict["label"] == true_label:
+                    self._correct_predictions += 1
+                snapshot = {
+                    name: (vote["label"], vote["confidence"])
+                    for name, vote in self._last_predict["module_votes"].items()
+                }
+                self.meta.adjust_weights(snapshot, true_label)
+            history_snapshot = list(self.history)
+            self.history.append(true_label)
+            self.markov.update(true_label, self.history)
+            if session_id and session_id != self._session_id:
+                self._session_id = session_id
+                log.info("New session detected: %s", session_id)
+        # GB add_sample outside RLock (has its own lock)
+        history_snapshot.append(true_label)
+        self.gb.add_sample(history_snapshot, true_label)
+
+    def stats(self) -> dict:
+        with self._lock:
+            acc = (self._correct_predictions / self._total_predictions
+                   if self._total_predictions else 0.0)
+            return {
+                "total_predictions":   self._total_predictions,
+                "correct_predictions": self._correct_predictions,
+                "accuracy":            round(acc, 4),
+                "history_len":         len(self.history),
+                "history_limit":       HISTORY_LIMIT,
+                "uptime_seconds":      round(time.time() - self._startup_time, 1),
+                "session_id":          self._session_id,
+                "module_weights": {
+                    k: round(v, 4) for k, v in self.meta.weights.items()
+                },
+                "gb": self.gb.status(),
+            }
+
+    def summary(self, n: int = 50) -> dict:
+        n = max(1, min(int(n), HISTORY_LIMIT))
+        with self._lock:
+            window = list(self.history)[-n:]
+        counts = {label: window.count(label) for label in LABELS}
+        return {
+            "window":        n,
+            "actual_window": len(window),
+            "counts":        counts,
+            "t_ratio":       round(counts.get("T", 0) / max(len(window), 1), 4),
+        }
+
+    def streak_info(self, n: int = 20) -> dict:
+        n = max(1, min(int(n), HISTORY_LIMIT))
+        with self._lock:
+            window = list(self.history)[-n:]
+        if not window:
+            return {"streak_label": None, "streak_length": 0}
+        current = window[-1]
+        length = 0
+        for lbl in reversed(window):
+            if lbl == current:
+                length += 1
+            else:
+                break
+        return {
+            "streak_label":  current,
+            "streak_length": length,
+            "window":        n,
+            "entropy":       round(_entropy({lb: window.count(lb) for lb in LABELS}), 4),
+        }
+
+    @staticmethod
+    def _build_reason(signals: dict, final_label: str) -> str:
+        agreement = sum(1 for v in signals.values() if v[0] == final_label)
+        total = len(signals)
+        return f"{agreement}/{total} modules đồng thuận → {final_label}"
+
+
+# ── Singleton ─────────────────────────────────────────────────────────────────
+
+predictor = KanoPredictor()
+
+
+# ── Startup loader ────────────────────────────────────────────────────────────
+
+def startup_load(history_api_url: str, max_pages: int = 10) -> None:
+    if not history_api_url:
+        log.info("HISTORY_API_URL not configured; skipping startup load.")
         return
-    key_input = args[0]
-    if uid not in user_data or user_data[uid].get("key") != key_input:
-        await update.message.reply_text("❌ *Key không hợp lệ!*", parse_mode="Markdown")
+    all_results: list[str] = []
+    for page in range(1, max_pages + 1):
+        url = f"{history_api_url}?page={page}"
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+            rows = data.get("data", [])
+            if not isinstance(rows, list):
+                break
+            page_results = [
+                _safe_label(r.get("resultTruyenThong"))
+                for r in rows if isinstance(r, dict)
+            ]
+            page_results = [x for x in page_results if x in LABELS]
+            if not page_results:
+                break
+            all_results = page_results + all_results
+            if len(all_results) >= HISTORY_LIMIT:
+                break
+        except Exception as exc:
+            log.warning("History API page %d failed: %s", page, exc)
+            break
+    predictor.load_history(all_results)
+
+
+# ── Flask app ─────────────────────────────────────────────────────────────────
+
+app = Flask(__name__)
+
+
+@app.get("/ping")
+def ping():
+    return jsonify({
+        "status":      "ok",
+        "service":     "kano-ai",
+        "history_len": len(predictor.history),
+        "gb_ready":    predictor.gb.is_ready,
+    })
+
+
+@app.get("/predict")
+def predict_endpoint():
+    return jsonify(predictor.predict())
+
+
+@app.post("/update")
+def update_endpoint():
+    payload = request.get_json(silent=True) or {}
+    label = (payload.get("label")
+             or payload.get("resultTruyenThong")
+             or payload.get("result"))
+    session_id = payload.get("session_id")
+    label = _safe_label(label)
+    if label is None:
+        return jsonify({"ok": False, "error": "label must be T or X"}), 400
+    predictor.update(label, session_id)
+    return jsonify({"ok": True, "updated_label": label, "stats": predictor.stats()})
+
+
+@app.get("/stats")
+def stats_endpoint():
+    return jsonify(predictor.stats())
+
+
+@app.get("/summary_50")
+def summary_50_endpoint():
+    return jsonify(predictor.summary(50))
+
+
+@app.get("/streak_20")
+def streak_20_endpoint():
+    return jsonify(predictor.streak_info(20))
+
+
+@app.get("/accuracy")
+def accuracy_endpoint():
+    return jsonify({"accuracy": predictor.stats()["accuracy"]})
+
+
+@app.get("/history")
+def history_endpoint():
+    with predictor._lock:
+        history = list(predictor.history)[-100:]
+    return jsonify({"history": history, "count": len(history)})
+
+
+@app.get("/")
+def root_endpoint():
+    return jsonify({
+        "service":   "kano-ai",
+        "status":    "running",
+        "endpoints": ["/ping", "/predict", "/update", "/stats",
+                      "/summary_50", "/streak_20", "/accuracy", "/history"],
+    })
+
+
+# ── Environment wiring ────────────────────────────────────────────────────────
+
+def initialize_from_environment() -> None:
+    enabled = os.getenv("ENABLE_STARTUP_LOAD", "true").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if not enabled:
         return
-    await update.message.reply_text(
-        f"╔══════════════════════╗\n"
-        f"   ✅ *KÍCH HOẠT THÀNH CÔNG*\n"
-        f"╚══════════════════════╝\n\n"
-        f"🔑 Key: `{key_input}`\n"
-        f"⏰ Hạn: *{user_data[uid].get('key_expiry', '---')}*\n\n"
-        f"🎯 Chúc bạn may mắn và thắng lớn!",
-        parse_mode="Markdown"
-    )
-
-# ===== GIFTCODE =====
-async def giftcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎁 *QUÀ TRI ÂN* 🎁\n\nHiện chưa có giftcode mới.\nTheo dõi kênh thông báo để nhận sớm nhất!",
-        parse_mode="Markdown"
-    )
-
-# ===== NẠP TIỀN =====
-async def show_nap_tien(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💰 *NẠP TIỀN VÍ*\n\nChọn số tiền:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("1.000đ",   callback_data="nap_1000")],
-            [InlineKeyboardButton("20.000đ",  callback_data="nap_20000")],
-            [InlineKeyboardButton("50.000đ",  callback_data="nap_50000")],
-            [InlineKeyboardButton("100.000đ", callback_data="nap_100000")],
-            [InlineKeyboardButton("200.000đ", callback_data="nap_200000")],
-            [InlineKeyboardButton("500.000đ", callback_data="nap_500000")],
-            [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")],
-        ])
-    )
-
-async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    api_url = os.getenv("HISTORY_API_URL", "").strip()
+    if not api_url:
+        return
     try:
-        amount = int(query.data.replace("nap_", ""))
+        max_pages = max(1, int(os.getenv("STARTUP_MAX_PAGES", "10")))
     except ValueError:
-        await query.edit_message_text("❌ Số tiền không hợp lệ.")
-        return
-    note   = f"KANO{random.randint(10000, 99999)}"
-    qr_url = (
-        f"https://img.vietqr.io/image/MB-0844551151-compact.png"
-        f"?amount={amount}&addInfo={note}&accountName=PHAM%20THE%20HIEN"
-    )
-    caption = (
-        f"╔══════════════════════╗\n"
-        f"   💰 *THÔNG TIN NẠP TIỀN*\n"
-        f"╚══════════════════════╝\n\n"
-        f"🏦 Bank:     *MBBANK*\n"
-        f"👤 Tên:      *PHAM THE HIEN*\n"
-        f"🔢 STK:      *0844551151*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💵 Số tiền:  *{amount:,}đ*\n"
-        f"📝 Nội dung: `{note}`\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ Nhập đúng nội dung `{note}`\n"
-        f"để hệ thống xác nhận giao dịch.\n\n"
-        f"✅ Số dư cộng ngay sau khi\n"
-        f"admin xác nhận chuyển khoản."
-    )
-    await query.message.reply_photo(photo=qr_url, caption=caption, parse_mode="Markdown")
-    await query.edit_message_text(
-        f"✅ *Đã tạo lệnh nạp tiền!*\n\n"
-        f"Quét mã QR bên trên hoặc chuyển khoản thủ công.\n"
-        f"💡 Mã giao dịch: `{note}`",
-        parse_mode="Markdown"
-    )
+        max_pages = 10
+    startup_load(api_url, max_pages=max_pages)
 
-# ===== ADMIN: NẠP TIỀN =====
-async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
-    if not is_admin(uid, uname):
-        await update.message.reply_text("❌ Chỉ admin mới dùng được lệnh này.")
-        return
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "📋 *Cú pháp:* `/naptien <user_id> <so_tien>`", parse_mode="Markdown"
-        )
-        return
-    try:
-        target_uid = int(args[0])
-        amount     = int(args[1])
-    except ValueError:
-        await update.message.reply_text("❌ user_id và số tiền phải là số.")
-        return
-    if target_uid not in user_data:
-        await update.message.reply_text(
-            f"❌ Không tìm thấy user `{target_uid}`.", parse_mode="Markdown"
-        )
-        return
-    user_data[target_uid]["balance"] += amount
-    bal = user_data[target_uid]["balance"]
-    await update.message.reply_text(
-        f"✅ Nạp *+{amount:,}đ* cho `{target_uid}`\nSố dư mới: *{bal:,}đ*",
-        parse_mode="Markdown"
-    )
-    try:
-        await context.bot.send_message(
-            chat_id=target_uid,
-            text=(
-                f"╔══════════════════════╗\n"
-                f"   🎉 *TÀI KHOẢN ĐƯỢC NẠP TIỀN*\n"
-                f"╚══════════════════════╝\n\n"
-                f"💵 Số tiền: *+{amount:,}đ*\n"
-                f"💰 Số dư: *{bal:,}đ*\n\n"
-                f"✅ Giao dịch xác nhận thành công!\n"
-                f"Cảm ơn bạn đã nạp tiền vào Kano AI. 🙏"
-            ),
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        log.warning(f"Không gửi được thông báo nạp tiền uid={target_uid}: {e}")
 
-# ===== FEEDBACK & THÔNG BÁO =====
-async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📝 *FEEDBACK*\n\nMọi ý kiến đóng góp vui lòng gửi qua kênh bên dưới.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📝 Gửi Feedback", url=FEEDBACK_LINK)]
-        ])
-    )
+def startup_initialize() -> None:
+    background = os.getenv("STARTUP_LOAD_BACKGROUND", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if background:
+        threading.Thread(
+            target=initialize_from_environment,
+            name="kano-startup-loader",
+            daemon=True,
+        ).start()
+    else:
+        initialize_from_environment()
 
-async def thongbao(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📢 *KÊNH THÔNG BÁO*\n\nTheo dõi để nhận thông báo và giftcode mới nhất!",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📢 Kênh Thông Báo", url=THONGBAO_LINK)]
-        ])
-    )
 
-# ===== MAIN =====
-def main():
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("active",  cmd_active))
-    app.add_handler(CommandHandler("naptien", cmd_naptien))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
-
-    app.add_handler(CallbackQueryHandler(cb_select_betvip,    pattern="^select_betvip$"))
-    app.add_handler(CallbackQueryHandler(cb_start_betvip,     pattern="^start_betvip$"))
-    app.add_handler(CallbackQueryHandler(cb_coming_soon,      pattern="^coming_soon$"))
-    app.add_handler(CallbackQueryHandler(cb_back_game_area,   pattern="^back_game_area$"))
-    app.add_handler(CallbackQueryHandler(back_main,           pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(buy_key,             pattern="^buykey_"))
-    app.add_handler(CallbackQueryHandler(tan_thu_used_notice, pattern="^tan_thu_used$"))
-    app.add_handler(CallbackQueryHandler(generate_qr,         pattern="^nap_"))
-
-    threading.Thread(target=run_flask, daemon=True).start()
-    threading.Thread(target=self_ping, daemon=True).start()
-
-    log.info("Bot Kano AI đang chạy...")
-    app.run_polling(drop_pending_updates=True)
+# ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    startup_initialize()
+    host = os.getenv("HOST", "0.0.0.0")
+    try:
+        port = int(os.getenv("PORT", "10000"))
+    except ValueError:
+        port = 10000
+    log.info("Starting Kano AI on %s:%d", host, port)
+    app.run(host=host, port=port, threaded=True)
