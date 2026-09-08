@@ -44,7 +44,7 @@ def self_ping():
 
 # ===== CẤU HÌNH =====
 # FIX: Token mới — token cũ đã bị lộ, revoke ngay trên BotFather
-TOKEN          = os.environ.get("BOT_TOKEN", "8891039285:AAF1zU82-TaJ2cnVIh3WJjrZvC6wx2PsgZI")
+TOKEN          = os.environ.get("BOT_TOKEN", "8891039285:AAExKcnxrITyL7MEzN8mvshpEfa4evodvsk")
 PREDICT_URL    = "https://bettv-predictor.onrender.com/predict"
 HISTORY_URL    = (
     "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
