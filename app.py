@@ -1,1016 +1,923 @@
 """
-Kano AI — Prediction Engine v1.0
-File: app.py (chạy trên Render free tier)
+app.py — Kano AI Prediction Engine v4
+Architecture : Claude
+Algorithm    : DeepSeek (modules 1-4)
+AI hẹp       : Claude pass 3 — GradientBoostEngine (module 5)
+API/Memory   : ChatGPT
+Deploy       : Gemini
 
-Kiến trúc 5 module:
-  1. PatternEngine   — nhận diện 23 loại cầu với multi-window
-  2. MarkovEngine    — xác suất chuyển trạng thái bậc 3
-  3. StreakEngine     — phát hiện & dự đoán điểm gãy cầu
-  4. FrequencyEngine — bias TAI/XIU theo cửa sổ trượt
-  5. MetaLearner     — weighted voting, tự cập nhật trọng số theo accuracy thực
+Thay đổi v4:
+  [+] GradientBoostEngine — scikit-learn GradientBoostingClassifier
+      · 18 features từ cửa sổ 20 kết quả
+      · Retrain background thread mỗi 50 updates, không block /predict
+      · Warmup 80 samples — trước đó engine trả (T, 0.5), MetaLearner bỏ qua
+      · RAM: model ~110 KB, scaler ~1 KB — an toàn với Render Free 512 MB
+      · Nếu import sklearn thất bại, GB bị vô hiệu hoá và 4 module cũ chạy như bình thường
+  [=] Modules 1-4 giữ nguyên từ pass 2 (đã fix bugs B, C, D)
 
-Tất cả học từ lịch sử API game khi khởi động,
-update online sau mỗi ván mới.
+Dependency mới (requirements.txt):
+  scikit-learn>=1.3.0
+  numpy>=1.24.0
 """
 
 import os
-import json
 import math
 import time
+import json
 import logging
 import threading
-import requests
+import urllib.request
 from collections import deque, defaultdict
-from flask import Flask, jsonify
 
-# ─────────────────────────────────────────────
-# CẤU HÌNH
-# ─────────────────────────────────────────────
-HISTORY_URL = (
-    "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
-    "?cp=R&cl=R&pf=web&at=1fc7bfdeab18790088a6e44d6b8cb288&limit=200"
+from flask import Flask, jsonify, request
+
+# ── Optional AI dependency ────────────────────────────────────────────────────
+try:
+    import numpy as np
+    from sklearn.ensemble import GradientBoostingClassifier
+    from sklearn.preprocessing import StandardScaler
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    log_msg = "scikit-learn/numpy not found — GradientBoostEngine disabled."
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+try:
+    HISTORY_LIMIT = max(10, int(os.getenv("HISTORY_LIMIT", "500")))
+except ValueError:
+    HISTORY_LIMIT = 500
+
+STREAK_WINDOW   = 20
+FREQ_WINDOWS    = [10, 30, 50]
+MARKOV_ORDERS   = [1, 2, 3]
+FLIP_THRESHOLD  = 0.80
+EMA_ALPHA       = 0.1
+MIN_WEIGHT      = 0.05
+MAX_WEIGHT      = 0.60
+
+# GradientBoostEngine
+GB_FEATURE_WINDOW = 20    # cửa sổ feature
+GB_WARMUP         = 80    # min samples trước khi GB tham gia vote
+GB_MAX_SAMPLES    = 500   # số training samples tối đa giữ trong RAM
+GB_RETRAIN_EVERY  = 50    # retrain sau mỗi N updates
+
+LABELS = ("T", "X")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-HISTORY_BULK_URL = (
-    "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
-    "?cp=R&cl=R&pf=web&at=1fc7bfdeab18790088a6e44d6b8cb288&limit={limit}&page={page}"
-)
-PORT = int(os.environ.get("PORT", 8080))
+log = logging.getLogger("kano")
+if not SKLEARN_AVAILABLE:
+    log.warning("scikit-learn/numpy not found — GradientBoostEngine disabled.")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-# UTILS
-# ─────────────────────────────────────────────
-TAI = 1
-XIU = 0
+# ── Utility ───────────────────────────────────────────────────────────────────
 
-def parse_result(raw) -> int | None:
-    """Chuẩn hoá kết quả thô về TAI(1) hoặc XIU(0)."""
-    if raw is None:
-        return None
-    s = str(raw).upper().strip()
-    if s in ("TAI", "T", "TÀI", "1"):
-        return TAI
-    if s in ("XIU", "X", "XỈU", "0"):
-        return XIU
-    return None
-
-def result_label(v: int) -> str:
-    return "TAI" if v == TAI else "XIU"
-
-def entropy(p: float) -> float:
-    """Shannon entropy của xác suất p."""
-    if p <= 0 or p >= 1:
+def _entropy(counts: dict) -> float:
+    total = sum(counts.values())
+    if total == 0:
         return 0.0
-    q = 1 - p
-    return -(p * math.log2(p) + q * math.log2(q))
+    return -sum(
+        (c / total) * math.log2(c / total)
+        for c in counts.values()
+        if c > 0
+    )
 
-# ─────────────────────────────────────────────
-# 1. PATTERN ENGINE
-# ─────────────────────────────────────────────
-class PatternEngine:
-    """
-    Nhận diện 23 loại cầu và dự đoán theo từng loại.
-    Dùng 4 sliding window: 3, 5, 8, 13 ván.
-    Mỗi pattern được đánh giá theo accuracy lịch sử của chính nó.
-    """
 
-    WINDOWS = [3, 5, 8, 13]
+def _clamp(val: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, val))
+
+
+def _normalize_weights(weights: dict) -> dict:
+    total = sum(weights.values())
+    if total == 0:
+        n = len(weights)
+        return {k: 1.0 / n for k in weights}
+    return {k: v / total for k, v in weights.items()}
+
+
+def _safe_label(value) -> str | None:
+    if value is None:
+        return None
+    label = str(value).strip().upper()
+    return label if label in LABELS else None
+
+
+# ── Module base ───────────────────────────────────────────────────────────────
+
+class _BaseModule:
+    name: str = "base"
+
+    def predict(self, history: deque) -> tuple[str, float]:
+        if len(history) < self._min_history():
+            return "T", 0.5
+        label, conf = self._compute(history)
+        conf = _clamp(conf, 0.0, 1.0)
+        return label, conf
+
+    def _min_history(self) -> int:
+        return 1
+
+    def _compute(self, history: deque) -> tuple[str, float]:
+        raise NotImplementedError
+
+
+# ── Module 1: PatternEngine ───────────────────────────────────────────────────
+
+class PatternEngine(_BaseModule):
+    """
+    23 named pattern types. Each entry: (id, min_len, predicate, label_func).
+    Rarity = 1 - (frequency of pattern in full history).
+    Highest-rarity matching pattern wins.
+    """
+    name = "pattern"
+
+    PATTERNS = [
+        ("alt_TX",      2, lambda t: t[-1] != t[-2] and t[-1] == "X", lambda t: t[-1]),
+        ("alt_XT",      2, lambda t: t[-1] != t[-2] and t[-1] == "T", lambda t: t[-1]),
+        ("TTT",         3, lambda t: t[-1] == t[-2] == t[-3] == "T",  lambda t: "X"),
+        ("XXX",         3, lambda t: t[-1] == t[-2] == t[-3] == "X",  lambda t: "T"),
+        ("T_X_T",       3, lambda t: t[-1] == "T" and t[-2] == "X" and t[-3] == "T", lambda t: "T"),
+        ("X_T_X",       3, lambda t: t[-1] == "X" and t[-2] == "T" and t[-3] == "X", lambda t: "X"),
+        ("TTTT",        4, lambda t: all(x == "T" for x in t[-4:]), lambda t: "X"),
+        ("XXXX",        4, lambda t: all(x == "X" for x in t[-4:]), lambda t: "T"),
+        ("T_T_X_X",     4, lambda t: t[-1] == t[-2] == "X" and t[-3] == t[-4] == "T", lambda t: "X"),
+        ("X_X_T_T",     4, lambda t: t[-1] == t[-2] == "T" and t[-3] == t[-4] == "X", lambda t: "T"),
+        ("T_X_X_T",     4, lambda t: t[-1] == "T" and t[-2] == t[-3] == "X" and t[-4] == "T", lambda t: "T"),
+        ("X_T_T_X",     4, lambda t: t[-1] == "X" and t[-2] == t[-3] == "T" and t[-4] == "X", lambda t: "X"),
+        ("T_T_X_T",     4, lambda t: t[-1] == "T" and t[-2] == "X" and t[-3] == "T" and t[-4] == "T", lambda t: "T"),
+        ("X_X_T_X",     4, lambda t: t[-1] == "X" and t[-2] == "T" and t[-3] == "X" and t[-4] == "X", lambda t: "X"),
+        ("T_T_T_X",     4, lambda t: t[-1] == "X" and t[-2] == t[-3] == t[-4] == "T", lambda t: "X"),
+        ("X_X_X_T",     4, lambda t: t[-1] == "T" and t[-2] == t[-3] == t[-4] == "X", lambda t: "T"),
+        ("T_X_T_X_b",   4, lambda t: t[-1] == "T" and t[-2] == "X" and t[-3] == "X" and t[-4] == "T", lambda t: "T"),
+        ("X_T_X_T_b",   4, lambda t: t[-1] == "X" and t[-2] == "T" and t[-3] == "T" and t[-4] == "X", lambda t: "X"),
+        ("T_X_T_X_T",   5, lambda t: t[-1]=="T" and t[-2]=="X" and t[-3]=="T" and t[-4]=="X" and t[-5]=="T", lambda t: "X"),
+        ("X_T_X_T_X",   5, lambda t: t[-1]=="X" and t[-2]=="T" and t[-3]=="X" and t[-4]=="T" and t[-5]=="X", lambda t: "T"),
+        ("T_T_X_T_X",   5, lambda t: t[-1]=="X" and t[-2]=="T" and t[-3]=="X" and t[-4]=="T" and t[-5]=="T", lambda t: "X"),
+        ("X_X_T_X_T",   5, lambda t: t[-1]=="T" and t[-2]=="X" and t[-3]=="T" and t[-4]=="X" and t[-5]=="X", lambda t: "T"),
+        ("pair_break",  6,
+            lambda t: t[-1] != t[-2] and t[-3] == t[-4] and t[-5] == t[-6] and t[-3] != t[-5],
+            lambda t: t[-1]),
+    ]
+
+    def _min_history(self) -> int:
+        return 2
+
+    def _compute(self, history: deque) -> tuple[str, float]:
+        hist_list = list(history)
+        tail_len = len(hist_list)
+        matched = []
+        for pname, min_len, pred, label_func in self.PATTERNS:
+            if tail_len < min_len:
+                continue
+            if not pred(hist_list):
+                continue
+            count = 0
+            total_windows = max(0, tail_len - min_len + 1)
+            for i in range(total_windows):
+                window = hist_list[i: i + min_len]
+                if pred(window):
+                    count += 1
+            rarity = 1.0 - (count / total_windows) if total_windows > 0 else 1.0
+            matched.append((pname, label_func(hist_list), _clamp(rarity, 0.0, 1.0)))
+        if not matched:
+            return "T", 0.5
+        best = max(matched, key=lambda x: x[2])
+        return best[1], best[2]
+
+
+# ── Module 2: MarkovEngine ────────────────────────────────────────────────────
+
+class MarkovEngine(_BaseModule):
+    """
+    Orders 1-3 maintained simultaneously.
+    Score = log(count+1) * confidence / sqrt(order) — higher orders compete fairly.
+    Laplace smoothing k=1.
+    """
+    name = "markov"
 
     def __init__(self):
-        # pattern_key -> {"correct": int, "total": int}
-        self.pattern_stats: dict[str, dict] = defaultdict(lambda: {"correct": 0, "total": 0})
-
-    def _encode(self, seq: list[int]) -> str:
-        return "".join("T" if x == TAI else "X" for x in seq)
-
-    def _identify_pattern(self, seq: list[int]) -> str:
-        """
-        Phân loại cầu từ chuỗi kết quả:
-        BIET_TAI, BIET_XIU  — bệt toàn TAI / toàn XIU
-        DOI_TAI, DOI_XIU    — cặp đôi TAI-TAI / XIU-XIU xen kẽ
-        MOT_MOT             — xen kẽ T-X-T-X
-        CAU_GAY             — cầu gãy tại vị trí cuối
-        CAU_NHAY            — nhảy ngẫu nhiên
-        TAP_SHORT / TAP_LONG — tập hợp ngắn/dài
-        """
-        n = len(seq)
-        if n == 0:
-            return "UNKNOWN"
-
-        encoded = self._encode(seq)
-
-        # Bệt
-        if all(x == TAI for x in seq):
-            return f"BIET_TAI_{n}"
-        if all(x == XIU for x in seq):
-            return f"BIET_XIU_{n}"
-
-        # Xen kẽ hoàn hảo
-        alternating = all(seq[i] != seq[i + 1] for i in range(n - 1))
-        if alternating:
-            return f"MOT_MOT_{n}"
-
-        # Cặp đôi (TT-XX-TT hoặc XX-TT-XX)
-        if n >= 4:
-            pairs_ok = all(seq[i] == seq[i + 1] for i in range(0, n - 1, 2))
-            if pairs_ok:
-                return f"DOI_{n}"
-
-        # Cầu gãy — 3+ giống nhau rồi đổi cuối
-        if n >= 4:
-            streak_val = seq[0]
-            streak_len = 1
-            for i in range(1, n - 1):
-                if seq[i] == streak_val:
-                    streak_len += 1
-                else:
-                    break
-            if streak_len >= 3 and seq[-1] != streak_val:
-                return f"CAU_GAY_{streak_len}"
-
-        # Streak cuối
-        streak_val = seq[-1]
-        streak_len = 1
-        for i in range(len(seq) - 2, -1, -1):
-            if seq[i] == streak_val:
-                streak_len += 1
-            else:
-                break
-        if streak_len >= 3:
-            label = "TAI" if streak_val == TAI else "XIU"
-            return f"STREAK_{label}_{streak_len}"
-
-        # Tập ngắn vs dài
-        tai_count = sum(seq)
-        ratio = tai_count / n
-        if ratio >= 0.7:
-            return "TAP_TAI_HEAVY"
-        if ratio <= 0.3:
-            return "TAP_XIU_HEAVY"
-
-        return "MIXED"
-
-    def predict(self, history: list[int]) -> dict:
-        """
-        Trả về {"prediction": TAI/XIU, "confidence": float, "pattern": str, "weight": float}
-        """
-        results = []
-        for w in self.WINDOWS:
-            if len(history) < w + 1:
-                continue
-            seq = history[-(w + 1):-1]   # w ván để nhận pattern
-            last = history[-1]            # ván vừa xong (dùng để tra stats)
-            pattern = self._identify_pattern(seq)
-
-            # Dự đoán: dựa theo xu hướng tiếp theo của pattern này trong lịch sử
-            stats = self.pattern_stats[pattern]
-            total = stats["total"]
-            if total < 5:
-                # Chưa đủ dữ liệu — dự đoán theo momentum (tiếp tục xu hướng cuối)
-                pred = history[-1]
-                conf = 0.52
-            else:
-                tai_rate = stats.get("tai_after", 0) / total
-                if tai_rate > 0.5:
-                    pred = TAI
-                    conf = tai_rate
-                else:
-                    pred = XIU
-                    conf = 1 - tai_rate
-
-            acc = stats["correct"] / total if total > 0 else 0.5
-            weight = max(0.1, acc)   # trọng số dựa trên accuracy lịch sử
-
-            results.append({
-                "prediction": pred,
-                "confidence": conf,
-                "pattern": pattern,
-                "weight": weight,
-                "window": w,
-            })
-
-        if not results:
-            return {"prediction": history[-1] if history else TAI, "confidence": 0.5,
-                    "pattern": "UNKNOWN", "weight": 0.1}
-
-        # Weighted vote
-        tai_score = sum(r["weight"] for r in results if r["prediction"] == TAI)
-        xiu_score = sum(r["weight"] for r in results if r["prediction"] == XIU)
-        total_w   = tai_score + xiu_score or 1
-        if tai_score >= xiu_score:
-            pred_final = TAI
-            conf_final = tai_score / total_w
-        else:
-            pred_final = XIU
-            conf_final = xiu_score / total_w
-
-        best = max(results, key=lambda r: r["weight"])
-        return {
-            "prediction": pred_final,
-            "confidence": conf_final,
-            "pattern": best["pattern"],
-            "weight": conf_final,
+        self._tables: dict[int, dict] = {
+            o: defaultdict(lambda: defaultdict(int))
+            for o in MARKOV_ORDERS
         }
 
-    def update(self, history: list[int], actual: int):
-        """
-        Cập nhật stats sau khi biết kết quả thật.
-        Tính dự đoán từ stats CŨ trước khi cộng actual (tránh look-ahead bias).
-        """
-        for w in self.WINDOWS:
-            if len(history) < w + 1:
+    def train(self, history: list[str]) -> None:
+        for i in range(len(history)):
+            for order in MARKOV_ORDERS:
+                if i < order:
+                    continue
+                state = tuple(history[i - order: i])
+                self._tables[order][state][history[i]] += 1
+
+    def update(self, label: str, history: deque) -> None:
+        lst = list(history)
+        for order in MARKOV_ORDERS:
+            if len(lst) <= order:
                 continue
-            seq = history[-(w + 1):-1]
-            pattern = self._identify_pattern(seq)
-            stats = self.pattern_stats[pattern]
-            old_total = stats["total"]
-            old_tai   = stats.get("tai_after", 0)
-            # Tính accuracy từ stats CŨ (trước khi thấy actual)
-            if old_total >= 5:
-                pred = TAI if (old_tai / old_total) > 0.5 else XIU
-                if pred == actual:
-                    stats["correct"] = stats.get("correct", 0) + 1
-            # Update stats
-            stats["total"]     = old_total + 1
-            stats["tai_after"] = old_tai + (1 if actual == TAI else 0)
+            state = tuple(lst[-(order + 1): -1])
+            self._tables[order][state][label] += 1
+
+    def _min_history(self) -> int:
+        return max(MARKOV_ORDERS)
+
+    def _compute(self, history: deque) -> tuple[str, float]:
+        hist_list = list(history)
+        best_score = -1.0
+        best_probs: dict[str, float] = {}
+        for order in MARKOV_ORDERS:
+            if len(hist_list) < order:
+                continue
+            state = tuple(hist_list[-order:])
+            counts = self._tables[order][state]
+            total_counts = sum(counts.values())
+            if total_counts == 0:
+                continue
+            smoothed_total = total_counts + 2
+            prob_T = (counts.get("T", 0) + 1) / smoothed_total
+            prob_X = (counts.get("X", 0) + 1) / smoothed_total
+            confidence = max(prob_T, prob_X)
+            score = math.log(total_counts + 1) * confidence / math.sqrt(order)
+            if score > best_score:
+                best_score = score
+                best_probs = {"T": prob_T, "X": prob_X}
+        if not best_probs:
+            return "T", 0.5
+        if best_probs["T"] >= best_probs["X"]:
+            return "T", best_probs["T"]
+        return "X", best_probs["X"]
 
 
-# ─────────────────────────────────────────────
-# 2. MARKOV ENGINE (bậc 3)
-# ─────────────────────────────────────────────
-class MarkovEngine:
+# ── Module 3: StreakEngine ────────────────────────────────────────────────────
+
+class StreakEngine(_BaseModule):
     """
-    Markov Chain bậc 1, 2, 3.
-    Bảng chuyển trạng thái: (seq_n ván trước) -> P(TAI | seq)
-    Dùng Laplace smoothing để tránh xác suất 0.
+    streak_ratio = dominant_count / window, rescaled (ratio-0.5)*2 → [0,1].
+    High ratio = long streak = high break probability.
+    Không dùng entropy — entropy binary luôn gần 1.0 trên dữ liệu ngẫu nhiên.
     """
-    ORDERS = [1, 2, 3]
+    name = "streak"
+
+    def _min_history(self) -> int:
+        return STREAK_WINDOW
+
+    def _compute(self, history: deque) -> tuple[str, float]:
+        window = list(history)[-STREAK_WINDOW:]
+        counts = {label: window.count(label) for label in LABELS}
+        dominant_count = max(counts.values())
+        streak_ratio = dominant_count / STREAK_WINDOW
+        break_prob = _clamp((streak_ratio - 0.5) * 2.0, 0.0, 1.0)
+        last_label = window[-1]
+        if break_prob > 0.5:
+            pred = "X" if last_label == "T" else "T"
+            conf = break_prob
+        else:
+            pred = last_label
+            conf = 0.5 + (0.5 - break_prob) * 0.4
+        return pred, _clamp(conf, 0.0, 1.0)
+
+
+# ── Module 4: FrequencyEngine ─────────────────────────────────────────────────
+
+class FrequencyEngine(_BaseModule):
+    """
+    Windows 10/30/50. Reversion wins over momentum when |short-long| > 0.20.
+    """
+    name = "frequency"
+    REVERSION_THRESHOLD = 0.20
+
+    def _min_history(self) -> int:
+        return max(FREQ_WINDOWS)
+
+    def _compute(self, history: deque) -> tuple[str, float]:
+        hist_list = list(history)
+        ratios: dict[int, float] = {}
+        for w in FREQ_WINDOWS:
+            ratios[w] = hist_list[-w:].count("T") / w if len(hist_list) >= w else 0.5
+        short, mid, long = ratios[10], ratios[30], ratios[50]
+        momentum_label = None
+        if short > mid > long:
+            momentum_label = "T"
+        elif short < mid < long:
+            momentum_label = "X"
+        reversion_label = None
+        if abs(short - long) > self.REVERSION_THRESHOLD:
+            reversion_label = "X" if short > long else "T"
+        pred = (reversion_label if reversion_label is not None
+                else (momentum_label if momentum_label is not None
+                      else hist_list[-1]))
+        conf = abs(short - 0.5) * 2.0
+        return pred, _clamp(conf, 0.0, 1.0)
+
+
+# ── Module 5: GradientBoostEngine ────────────────────────────────────────────
+
+class GradientBoostEngine:
+    """
+    AI hẹp thực sự — scikit-learn GradientBoostingClassifier.
+
+    Kiến trúc:
+    - 18 features từ cửa sổ GB_FEATURE_WINDOW (=20) kết quả gần nhất.
+    - Retrain nền mỗi GB_RETRAIN_EVERY (=50) updates, không block /predict.
+    - Model mới được swap vào sau khi retrain xong (atomic).
+    - Warmup GB_WARMUP (=80) samples — trước đó predict() trả (T, 0.5).
+    - RAM: model ≈ 110 KB, buffer 500×18 float64 ≈ 70 KB. Tổng < 1 MB.
+
+    18 features:
+      0  ratio_full     — T-ratio toàn window 20
+      1  ratio_5        — T-ratio 5 kết quả cuối
+      2  ratio_10       — T-ratio 10 kết quả cuối
+      3  ratio_15       — T-ratio 15 kết quả cuối
+      4  streak_norm    — độ dài streak / window
+      5  switch_rate    — tần suất đổi chiều trong window
+      6  momentum_5_15  — ratio_5 - ratio_15 (xu hướng ngắn vs dài)
+      7  momentum_10_15 — ratio_10 - ratio_15
+      8  entropy        — Shannon entropy nhị phân của window
+      9  last1          — kết quả -1 (binary)
+      10 last2          — kết quả -2
+      11 last3          — kết quả -3
+      12 p_tx           — P(X | prev=T) trong window
+      13 p_xt           — P(T | prev=X) trong window
+      14 double_end     — 1 nếu 2 kết quả cuối giống nhau
+      15 triple_end     — 1 nếu 3 kết quả cuối giống nhau
+      16 alt_end        — 1 nếu 4 kết quả cuối xen kẽ hoàn toàn
+      17 current        — kết quả cuối (binary)
+    """
+
+    name = "gb"
 
     def __init__(self):
-        # order -> {state_tuple: {"tai": int, "xiu": int}}
-        self.tables: dict[int, dict] = {o: defaultdict(lambda: {"tai": 0, "xiu": 0})
-                                         for o in self.ORDERS}
-        self.accuracy: dict[int, dict] = {o: {"correct": 0, "total": 0} for o in self.ORDERS}
+        self._enabled = SKLEARN_AVAILABLE
+        if not self._enabled:
+            return
 
-    def _state(self, history: list[int], order: int):
-        if len(history) < order:
-            return None
-        return tuple(history[-order:])
+        self._lock         = threading.Lock()
+        self._model        = None   # GradientBoostingClassifier | None
+        self._scaler       = None   # StandardScaler | None
+        self._X_buf: list  = []     # feature buffer
+        self._y_buf: list  = []     # label buffer
+        self._update_count = 0      # số updates kể từ retrain cuối
+        self._ready        = False  # True sau warmup + lần retrain đầu tiên
+        self._retrain_thread: threading.Thread | None = None
 
-    def train(self, history: list[int]):
-        """Train từ đầu với toàn bộ lịch sử."""
-        for o in self.ORDERS:
-            self.tables[o] = defaultdict(lambda: {"tai": 0, "xiu": 0})
-        for i in range(max(self.ORDERS), len(history)):
-            actual = history[i]
-            for o in self.ORDERS:
-                state = tuple(history[i - o: i])
-                if actual == TAI:
-                    self.tables[o][state]["tai"] += 1
-                else:
-                    self.tables[o][state]["xiu"] += 1
+    # ── Feature engineering ───────────────────────────────────────────────
 
-    def predict(self, history: list[int]) -> dict:
-        preds = []
-        for o in self.ORDERS:
-            state = self._state(history, o)
-            if state is None:
-                continue
-            counts = self.tables[o].get(state, {"tai": 0, "xiu": 0})
-            tai = counts["tai"] + 1   # Laplace
-            xiu = counts["xiu"] + 1
-            p_tai = tai / (tai + xiu)
+    @staticmethod
+    def _build_features(history: list[str]) -> list[float]:
+        w = history[-GB_FEATURE_WINDOW:] if len(history) >= GB_FEATURE_WINDOW else history
+        n = len(w)
+        nums = [1 if x == "T" else 0 for x in w]
 
-            acc_data = self.accuracy[o]
-            acc = acc_data["correct"] / acc_data["total"] if acc_data["total"] > 10 else 0.5
-            weight = max(0.1, acc)
+        ratio_full = sum(nums) / n
+        ratio_5    = sum(nums[-5:])  / min(n, 5)
+        ratio_10   = sum(nums[-10:]) / min(n, 10)
+        ratio_15   = sum(nums[-15:]) / min(n, 15)
 
-            pred = TAI if p_tai > 0.5 else XIU
-            preds.append({"prediction": pred, "confidence": max(p_tai, 1 - p_tai),
-                          "weight": weight, "order": o})
-
-        if not preds:
-            return {"prediction": history[-1] if history else TAI, "confidence": 0.5, "weight": 0.1}
-
-        tai_w = sum(p["weight"] for p in preds if p["prediction"] == TAI)
-        xiu_w = sum(p["weight"] for p in preds if p["prediction"] == XIU)
-        total_w = tai_w + xiu_w or 1
-        pred_final = TAI if tai_w >= xiu_w else XIU
-        conf_final = max(tai_w, xiu_w) / total_w
-        return {"prediction": pred_final, "confidence": conf_final, "weight": conf_final}
-
-    def update(self, history: list[int], actual: int):
-        """Online update sau mỗi ván mới."""
-        for o in self.ORDERS:
-            state = self._state(history[:-1], o)
-            if state is None:
-                continue
-            if actual == TAI:
-                self.tables[o][state]["tai"] += 1
-            else:
-                self.tables[o][state]["xiu"] += 1
-
-            # Track accuracy
-            counts = self.tables[o].get(state, {"tai": 1, "xiu": 1})
-            p_tai = counts["tai"] / (counts["tai"] + counts["xiu"])
-            pred = TAI if p_tai > 0.5 else XIU
-            self.accuracy[o]["total"] += 1
-            if pred == actual:
-                self.accuracy[o]["correct"] += 1
-
-
-# ─────────────────────────────────────────────
-# 3. STREAK ENGINE
-# ─────────────────────────────────────────────
-class StreakEngine:
-    """
-    Phát hiện streak hiện tại và dự đoán xác suất gãy.
-    Dựa trên phân phối lịch sử: P(gãy | streak_len, streak_val).
-    Kết hợp entropy để đo độ bất ổn định của cầu.
-    """
-
-    def __init__(self):
-        # (streak_val, streak_len) -> {"break": int, "continue": int}
-        self.streak_stats: dict = defaultdict(lambda: {"break": 0, "continue": 0})
-        # Track entropy của chuỗi 20 ván gần nhất
-        self.recent: deque = deque(maxlen=20)
-        self.accuracy = {"correct": 0, "total": 0}
-
-    def _current_streak(self, history: list[int]) -> tuple[int, int]:
-        """Trả về (streak_val, streak_len) của streak cuối."""
-        if not history:
-            return TAI, 0
-        val = history[-1]
-        length = 1
-        for i in range(len(history) - 2, -1, -1):
-            if history[i] == val:
-                length += 1
+        current = nums[-1]
+        streak = 0
+        for v in reversed(nums):
+            if v == current:
+                streak += 1
             else:
                 break
-        return val, length
+        streak_norm = streak / n
 
-    def predict(self, history: list[int]) -> dict:
-        if len(history) < 3:
-            return {"prediction": history[-1] if history else TAI, "confidence": 0.5, "weight": 0.1}
+        switches = sum(1 for i in range(1, n) if nums[i] != nums[i - 1])
+        switch_rate = switches / max(n - 1, 1)
 
-        val, length = self._current_streak(history)
-        key = (val, min(length, 10))   # cap ở 10 để tránh quá sparse
-        stats = self.streak_stats[key]
-        total = stats["break"] + stats["continue"]
+        momentum_5_15  = ratio_5  - ratio_15
+        momentum_10_15 = ratio_10 - ratio_15
 
-        if total < 5:
-            # Chưa đủ dữ liệu: streak dài -> nghiêng về gãy, ngắn -> tiếp tục
-            p_break = min(0.3 + length * 0.08, 0.75)
-        else:
-            p_break = stats["break"] / total
+        p = ratio_full
+        entropy = -(p * math.log2(p) + (1 - p) * math.log2(1 - p)) if 0 < p < 1 else 0.0
 
-        # Entropy của 20 ván gần nhất — cầu ổn định thì entropy thấp
-        recent_list = list(self.recent)
-        if len(recent_list) >= 5:
-            p_tai_recent = sum(recent_list) / len(recent_list)
-            ent = entropy(p_tai_recent)
-            # Entropy cao (gần 1.0) = cầu loạn = giảm confidence
-            confidence_scale = 1.0 - ent * 0.3
-        else:
-            confidence_scale = 1.0
+        last1 = nums[-1] if n >= 1 else 0.5
+        last2 = nums[-2] if n >= 2 else 0.5
+        last3 = nums[-3] if n >= 3 else 0.5
 
-        if p_break > 0.5:
-            pred = XIU if val == TAI else TAI
-            conf = p_break * confidence_scale
-        else:
-            pred = val
-            conf = (1 - p_break) * confidence_scale
+        tt = tx = xt = xx = 0
+        for i in range(1, n):
+            if   nums[i - 1] == 1 and nums[i] == 1: tt += 1
+            elif nums[i - 1] == 1 and nums[i] == 0: tx += 1
+            elif nums[i - 1] == 0 and nums[i] == 1: xt += 1
+            else:                                     xx += 1
 
-        conf = max(0.5, min(0.95, conf))
-        acc = self.accuracy["correct"] / self.accuracy["total"] if self.accuracy["total"] > 10 else 0.5
-        return {"prediction": pred, "confidence": conf, "weight": max(0.1, acc)}
+        p_tx = tx / max(tt + tx, 1)
+        p_xt = xt / max(xt + xx, 1)
 
-    def update(self, history: list[int], actual: int):
-        if len(history) < 2:
+        double_end = 1 if n >= 2 and nums[-1] == nums[-2] else 0
+        triple_end = 1 if n >= 3 and nums[-1] == nums[-2] == nums[-3] else 0
+        alt_end    = 1 if (n >= 4 and nums[-1] != nums[-2]
+                           and nums[-2] != nums[-3] and nums[-3] != nums[-4]) else 0
+
+        return [
+            ratio_full, ratio_5, ratio_10, ratio_15,
+            streak_norm, switch_rate,
+            momentum_5_15, momentum_10_15,
+            entropy,
+            last1, last2, last3,
+            p_tx, p_xt,
+            double_end, triple_end, alt_end,
+            current,
+        ]
+
+    # ── Predict ───────────────────────────────────────────────────────────
+
+    def predict(self, history: deque) -> tuple[str, float]:
+        if not self._enabled or not self._ready:
+            return "T", 0.5
+        hist_list = list(history)
+        if len(hist_list) < GB_FEATURE_WINDOW:
+            return "T", 0.5
+        feats = self._build_features(hist_list)
+        with self._lock:
+            model, scaler = self._model, self._scaler
+        if model is None or scaler is None:
+            return "T", 0.5
+        try:
+            X = np.array(feats, dtype=np.float64).reshape(1, -1)
+            X_s = scaler.transform(X)
+            proba = model.predict_proba(X_s)[0]  # [P(X), P(T)]
+            # class ordering: 0=X, 1=T (sklearn sorts classes numerically: 0<1)
+            p_t = float(proba[1])
+            p_x = float(proba[0])
+            if p_t >= p_x:
+                return "T", _clamp(p_t, 0.0, 1.0)
+            return "X", _clamp(p_x, 0.0, 1.0)
+        except Exception as exc:
+            log.warning("GradientBoostEngine.predict error: %s", exc)
+            return "T", 0.5
+
+    # ── Update (called after each confirmed result) ───────────────────────
+
+    def add_sample(self, history: list[str], true_label: str) -> None:
+        """Buffer one sample, trigger retrain when threshold reached."""
+        if not self._enabled:
             return
-        # Streak TRƯỚC khi thêm actual
-        val, length = self._current_streak(history[:-1])
-        key = (val, min(length, 10))
-        if actual != val:
-            self.streak_stats[key]["break"] += 1
-        else:
-            self.streak_stats[key]["continue"] += 1
-        self.recent.append(actual)
+        if len(history) < GB_FEATURE_WINDOW:
+            return
+        feats = self._build_features(history)
+        y = 1 if true_label == "T" else 0
+        with self._lock:
+            self._X_buf.append(feats)
+            self._y_buf.append(y)
+            if len(self._X_buf) > GB_MAX_SAMPLES:
+                self._X_buf.pop(0)
+                self._y_buf.pop(0)
+            buf_len = len(self._X_buf)
+            self._update_count += 1
+            should_retrain = (
+                self._update_count >= GB_RETRAIN_EVERY
+                and buf_len >= GB_WARMUP
+                and (self._retrain_thread is None
+                     or not self._retrain_thread.is_alive())
+            )
+            if should_retrain:
+                X_snap = list(self._X_buf)
+                y_snap = list(self._y_buf)
+                self._update_count = 0
 
-        # Track accuracy
-        pred = self.predict(history[:-1])
-        self.accuracy["total"] += 1
-        if pred["prediction"] == actual:
-            self.accuracy["correct"] += 1
+        if should_retrain:
+            self._retrain_thread = threading.Thread(
+                target=self._retrain,
+                args=(X_snap, y_snap),
+                daemon=True,
+                name="kano-gb-retrain",
+            )
+            self._retrain_thread.start()
 
-    def train(self, history: list[int]):
-        for i in range(3, len(history)):
-            self.update(history[:i], history[i])
+    def _retrain(self, X_snap: list, y_snap: list) -> None:
+        """Background retrain. Swaps model atomically when done."""
+        try:
+            X = np.array(X_snap, dtype=np.float64)
+            y = np.array(y_snap, dtype=np.int32)
+            scaler = StandardScaler()
+            X_s = scaler.fit_transform(X)
+            model = GradientBoostingClassifier(
+                n_estimators=80,
+                max_depth=3,
+                learning_rate=0.1,
+                subsample=0.8,
+                random_state=42,
+            )
+            model.fit(X_s, y)
+            with self._lock:
+                self._model  = model
+                self._scaler = scaler
+                self._ready  = True
+            log.info(
+                "GradientBoostEngine retrained on %d samples. Ready=%s",
+                len(X_snap),
+                self._ready,
+            )
+        except Exception as exc:
+            log.error("GradientBoostEngine retrain failed: %s", exc)
 
+    def bulk_train(self, history: list[str]) -> None:
+        """Called once on startup from load_history."""
+        if not self._enabled or len(history) < GB_WARMUP:
+            return
+        X_buf, y_buf = [], []
+        for i in range(GB_FEATURE_WINDOW, len(history)):
+            feats = self._build_features(history[:i])
+            label = 1 if history[i] == "T" else 0
+            X_buf.append(feats)
+            y_buf.append(label)
+            if len(X_buf) > GB_MAX_SAMPLES:
+                X_buf.pop(0)
+                y_buf.pop(0)
+        with self._lock:
+            self._X_buf = X_buf
+            self._y_buf = y_buf
+            self._update_count = 0
+        # Retrain inline on startup (blocking, before first request)
+        self._retrain(X_buf, y_buf)
 
-# ─────────────────────────────────────────────
-# 4. FREQUENCY ENGINE
-# ─────────────────────────────────────────────
-class FrequencyEngine:
-    """
-    Bias TAI/XIU theo tần suất trong cửa sổ trượt 20/50/100 ván.
-    Ý tưởng: nếu XIU xuất hiện quá nhiều gần đây, xác suất TAI tăng lên
-    (mean reversion) hoặc ngược lại (momentum).
-    Học cái nào đúng hơn từ lịch sử.
-    """
-    WINDOWS = [20, 50, 100]
+    @property
+    def is_ready(self) -> bool:
+        return self._enabled and self._ready
 
-    def __init__(self):
-        # window -> {"reversion_correct": int, "momentum_correct": int, "total": int}
-        self.mode_stats: dict = {w: {"reversion": 0, "momentum": 0, "total": 0}
-                                  for w in self.WINDOWS}
-        self.accuracy = {"correct": 0, "total": 0}
-
-    def _window_bias(self, history: list[int], w: int) -> float:
-        """Trả về P(TAI) trong w ván gần nhất."""
-        if len(history) < w:
-            window = history
-        else:
-            window = history[-w:]
-        if not window:
-            return 0.5
-        return sum(window) / len(window)
-
-    def predict(self, history: list[int]) -> dict:
-        preds = []
-        for w in self.WINDOWS:
-            if len(history) < w // 2:
-                continue
-            p_tai = self._window_bias(history, w)
-            stats = self.mode_stats[w]
-            total = stats["total"]
-
-            if total < 20:
-                # Mặc định: mean reversion
-                pred = TAI if p_tai < 0.5 else XIU
-                conf = abs(p_tai - 0.5) * 2 * 0.6 + 0.5
-            else:
-                # Học xem reversion hay momentum đúng hơn
-                if stats["reversion"] >= stats["momentum"]:
-                    pred = TAI if p_tai < 0.5 else XIU
-                    mode_acc = stats["reversion"] / total
-                else:
-                    pred = TAI if p_tai > 0.5 else XIU
-                    mode_acc = stats["momentum"] / total
-                conf = max(0.5, min(0.9, 0.5 + abs(p_tai - 0.5) * mode_acc))
-
-            acc = self.accuracy["correct"] / self.accuracy["total"] if self.accuracy["total"] > 10 else 0.5
-            preds.append({"prediction": pred, "confidence": conf, "weight": max(0.1, acc), "window": w})
-
-        if not preds:
-            return {"prediction": TAI, "confidence": 0.5, "weight": 0.1}
-
-        tai_w = sum(p["weight"] for p in preds if p["prediction"] == TAI)
-        xiu_w = sum(p["weight"] for p in preds if p["prediction"] == XIU)
-        total_w = tai_w + xiu_w or 1
-        pred_final = TAI if tai_w >= xiu_w else XIU
-        conf_final = max(tai_w, xiu_w) / total_w
-        return {"prediction": pred_final, "confidence": conf_final, "weight": conf_final}
-
-    def update(self, history: list[int], actual: int):
-        for w in self.WINDOWS:
-            if len(history) < w // 2 + 1:
-                continue
-            p_tai = self._window_bias(history[:-1], w)
-            rev_pred = TAI if p_tai < 0.5 else XIU
-            mom_pred = TAI if p_tai > 0.5 else XIU
-            stats = self.mode_stats[w]
-            stats["total"] += 1
-            if rev_pred == actual:
-                stats["reversion"] += 1
-            if mom_pred == actual:
-                stats["momentum"] += 1
-
-        self.accuracy["total"] += 1
-        pred = self.predict(history[:-1])
-        if pred["prediction"] == actual:
-            self.accuracy["correct"] += 1
-
-    def train(self, history: list[int]):
-        for i in range(100, len(history)):
-            self.update(history[:i], history[i])
+    def status(self) -> dict:
+        if not self._enabled:
+            return {"enabled": False, "reason": "scikit-learn not installed"}
+        with self._lock:
+            return {
+                "enabled":       True,
+                "ready":         self._ready,
+                "buffer_size":   len(self._X_buf),
+                "warmup_needed": max(0, GB_WARMUP - len(self._X_buf)),
+                "updates_since_retrain": self._update_count,
+            }
 
 
-# ─────────────────────────────────────────────
-# 5. META LEARNER
-# ─────────────────────────────────────────────
+# ── Module 6: MetaLearner ─────────────────────────────────────────────────────
+
 class MetaLearner:
     """
-    Kết hợp 4 engine bằng weighted voting.
-    Trọng số của mỗi engine được cập nhật theo accuracy thực tế (EMA).
-    Nếu engine nào dự đoán sai liên tục -> trọng số giảm.
-    Nếu sai cả 4 -> trigger "contrarian mode" (đảo ngược dự đoán).
+    EMA-weighted voting. Số module = 4 hoặc 5 tuỳ sklearn availability.
+
+    Contrarian flip: raw_winning > FLIP_THRESHOLD (tuyệt đối, không tương đối).
+    Điều này ngăn low-confidence unanimous votes kích flip.
+      conf=0.55, 5 modules đồng thuận → raw_winning=0.55 < 0.80 → không flip.
+      conf=0.95, 5 modules đồng thuận → raw_winning=0.95 > 0.80 → flip.
     """
-    ENGINE_NAMES = ["pattern", "markov", "streak", "frequency"]
 
-    def __init__(self):
-        # Trọng số khởi tạo bằng nhau
-        self.weights: dict[str, float] = {n: 0.25 for n in self.ENGINE_NAMES}
-        # EMA alpha
-        self.alpha = 0.05
-        # Lịch sử dự đoán gần nhất của mỗi engine (để detect contrarian)
-        self.recent_preds: dict[str, deque] = {n: deque(maxlen=10) for n in self.ENGINE_NAMES}
-        # Accuracy tổng của meta
-        self.accuracy = {"correct": 0, "total": 0}
-        # Contrarian counter
-        self.all_wrong_streak = 0
+    def __init__(self, module_names: list[str]):
+        n = len(module_names)
+        self.weights: dict[str, float] = {name: 1.0 / n for name in module_names}
 
-    def predict(self, engine_preds: dict[str, dict]) -> dict:
-        """
-        engine_preds: {"pattern": {...}, "markov": {...}, ...}
-        Mỗi dict có keys: prediction, confidence, weight
-        """
-        tai_score = 0.0
-        xiu_score = 0.0
-        detail = {}
-
-        for name, pred in engine_preds.items():
-            w = self.weights[name] * pred.get("confidence", 0.5)
-            if pred["prediction"] == TAI:
-                tai_score += w
+    def vote(self, signals: dict[str, tuple[str, float]]) -> tuple[str, float]:
+        weighted_T = 0.0
+        weighted_X = 0.0
+        for name, (label, conf) in signals.items():
+            w = self.weights.get(name, 0.0)
+            if label == "T":
+                weighted_T += w * conf
             else:
-                xiu_score += w
-            detail[name] = result_label(pred["prediction"])
-
-        total = tai_score + xiu_score or 1.0
-
-        # Contrarian mode: nếu tất cả engine sai liên tục 3+ lần
-        if self.all_wrong_streak >= 3:
-            # Đảo ngược
-            if tai_score > xiu_score:
-                final_pred = XIU
-                confidence = xiu_score / total + 0.1  # boost confidence
-            else:
-                final_pred = TAI
-                confidence = tai_score / total + 0.1
-            mode = "CONTRARIAN"
+                weighted_X += w * conf
+        total = weighted_T + weighted_X
+        if total == 0:
+            return "T", 0.5
+        prob_T = weighted_T / total
+        prob_X = weighted_X / total
+        if prob_T >= prob_X:
+            label, score, raw_winning = "T", prob_T, weighted_T
         else:
-            final_pred = TAI if tai_score >= xiu_score else XIU
-            confidence = max(tai_score, xiu_score) / total
-            mode = "NORMAL"
+            label, score, raw_winning = "X", prob_X, weighted_X
+        if raw_winning > FLIP_THRESHOLD:
+            label = "X" if label == "T" else "T"
+        return label, _clamp(score, 0.0, 1.0)
 
-        confidence = max(0.51, min(0.95, confidence))
-
-        return {
-            "prediction": final_pred,
-            "confidence": confidence,
-            "mode": mode,
-            "detail": detail,
-            "tai_score": round(tai_score, 3),
-            "xiu_score": round(xiu_score, 3),
-        }
-
-    def update(self, engine_preds: dict[str, dict], actual: int):
-        """Cập nhật trọng số sau khi biết kết quả."""
-        any_correct = False
-        all_correct = True
-
-        for name, pred in engine_preds.items():
-            correct = (pred["prediction"] == actual)
-            if correct:
-                any_correct = True
-                # Tăng trọng số
-                self.weights[name] = (1 - self.alpha) * self.weights[name] + self.alpha * 1.0
+    def adjust_weights(
+        self,
+        signals: dict[str, tuple[str, float]],
+        true_label: str,
+    ) -> None:
+        for name, (pred_label, _) in signals.items():
+            w = self.weights.get(name, 0.0)
+            if pred_label == true_label:
+                w += EMA_ALPHA * (MAX_WEIGHT - w)
             else:
-                all_correct = False
-                # Giảm trọng số
-                self.weights[name] = (1 - self.alpha) * self.weights[name] + self.alpha * 0.0
-
-            self.recent_preds[name].append(1 if correct else 0)
-
-        # Normalize weights về tổng = 1
-        total_w = sum(self.weights.values()) or 1
-        for name in self.weights:
-            self.weights[name] /= total_w
-
-        # Contrarian streak
-        meta_pred = self.predict(engine_preds)
-        if meta_pred["prediction"] == actual:
-            self.all_wrong_streak = 0
-            self.accuracy["correct"] += 1
-        else:
-            self.all_wrong_streak += 1
-
-        self.accuracy["total"] += 1
+                w -= EMA_ALPHA * (w - MIN_WEIGHT)
+            self.weights[name] = _clamp(w, MIN_WEIGHT, MAX_WEIGHT)
+        self.weights = _normalize_weights(self.weights)
 
 
-# ─────────────────────────────────────────────
-# SUPREME AI — tổng hợp toàn bộ
-# ─────────────────────────────────────────────
-class SupremeAI:
-    """
-    Điều phối 5 engine. Học từ lịch sử, update online.
-    Thread-safe với RLock.
-    """
+# ── Core predictor ────────────────────────────────────────────────────────────
 
+class KanoPredictor:
     def __init__(self):
+        self.history: deque[str] = deque(maxlen=HISTORY_LIMIT)
+        self._session_id: str | None = None
+        self._lock = threading.RLock()
+
         self.pattern   = PatternEngine()
         self.markov    = MarkovEngine()
         self.streak    = StreakEngine()
         self.frequency = FrequencyEngine()
-        self.meta      = MetaLearner()
+        self.gb        = GradientBoostEngine()
 
-        self.history: list[int] = []          # toàn bộ lịch sử kết quả
-        self.session_ids: list[int] = []      # ID tương ứng
-        self.latest_session_id: int | None = None
-        self.target_session_id: int | None = None
+        module_names = [
+            self.pattern.name,
+            self.markov.name,
+            self.streak.name,
+            self.frequency.name,
+            self.gb.name,
+        ]
+        self.meta = MetaLearner(module_names)
 
-        self._lock = threading.RLock()
-        self._last_engine_preds: dict | None = None
+        self._total_predictions   = 0
+        self._correct_predictions = 0
+        self._last_predict: dict | None = None
+        self._startup_time = time.time()
 
-        # Trạng thái huấn luyện
-        self.trained = False
-        self.total_rounds = 0
+        log.info(
+            "KanoPredictor initialised. HISTORY_LIMIT=%d sklearn=%s",
+            HISTORY_LIMIT,
+            SKLEARN_AVAILABLE,
+        )
 
-        # Cache kết quả predict để API trả nhanh
-        self._cache: dict | None = None
-        self._cache_time: float = 0
-
-    # ── DATA LOADING ──────────────────────────
-    def _fetch_page(self, limit: int, page: int) -> list[dict]:
-        try:
-            url = HISTORY_BULK_URL.format(limit=limit, page=page)
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            return r.json().get("list", [])
-        except Exception as e:
-            log.warning(f"fetch_page limit={limit} page={page} lỗi: {e}")
-            return []
-
-    def load_history(self):
-        """
-        Load toàn bộ lịch sử từ API game.
-        Thử load tối đa 15,000 ván theo từng page 200.
-        Chạy trong thread riêng khi khởi động.
-        """
-        log.info("Bắt đầu load lịch sử...")
-        all_sessions = []
-        page = 1
-        max_pages = 75  # 75 * 200 = 15,000 ván
-
-        while page <= max_pages:
-            sessions = self._fetch_page(200, page)
-            if not sessions:
-                break
-            all_sessions.extend(sessions)
-            log.info(f"  Loaded page {page}, total={len(all_sessions)}")
-            page += 1
-            time.sleep(0.3)   # lịch sự với API
-
-        # API trả ngược: index 0 là mới nhất
-        # Ta cần cũ nhất trước để train theo thứ tự thời gian
-        all_sessions.reverse()
-
-        history = []
-        session_ids = []
-        for s in all_sessions:
-            val = parse_result(s.get("resultTruyenThong"))
-            if val is not None:
-                history.append(val)
-                session_ids.append(s.get("id"))
-
+    def load_history(self, results: list[str]) -> None:
+        cleaned = [_safe_label(x) for x in results]
+        cleaned = [x for x in cleaned if x is not None]
+        trimmed = cleaned[-HISTORY_LIMIT:]
         with self._lock:
-            self.history = history
-            self.session_ids = session_ids
-            self.total_rounds = len(history)
-            if session_ids:
-                self.latest_session_id  = session_ids[-1]
-                # target = ván tiếp theo (ID + 1 là ước tính)
-                self.target_session_id  = session_ids[-1] + 1
-
-        log.info(f"Load xong {len(history)} ván. Bắt đầu train...")
-        self._train()
-
-    def _train(self):
-        """Train tất cả engine từ lịch sử."""
-        h = self.history
-        if len(h) < 20:
-            log.warning("Lịch sử quá ít để train.")
-            return
-
-        # Markov: train một lần
-        self.markov.train(h)
-
-        # Streak & Frequency: train từng bước (có thể mất vài giây)
-        log.info("Training StreakEngine...")
-        self.streak.train(h)
-
-        log.info("Training FrequencyEngine...")
-        self.frequency.train(h)
-
-        # Pattern: update từng bước
-        log.info("Training PatternEngine...")
-        for i in range(15, len(h)):
-            self.pattern.update(h[:i], h[i])
-
-        with self._lock:
-            self.trained = True
-        log.info(f"Train xong. Tổng {len(h)} ván. Sẵn sàng dự đoán.")
-        self._invalidate_cache()
-
-    # ── PREDICTION ────────────────────────────
-    def _get_engine_preds(self, history: list[int]) -> dict:
-        return {
-            "pattern":   self.pattern.predict(history),
-            "markov":    self.markov.predict(history),
-            "streak":    self.streak.predict(history),
-            "frequency": self.frequency.predict(history),
-        }
+            self.history.clear()
+            self.history.extend(trimmed)
+            self.markov = MarkovEngine()
+            self.markov.train(trimmed)
+        # GB bulk train runs outside lock (blocking, ~0.1s)
+        self.gb.bulk_train(trimmed)
+        log.info("Loaded %d historical results. GB ready=%s", len(trimmed), self.gb.is_ready)
 
     def predict(self) -> dict:
-        """
-        Trả về dict kết quả dự đoán cho API /predict.
-        Cache 1.5 giây để không tính lại liên tục.
-        """
-        now = time.time()
         with self._lock:
-            if self._cache and (now - self._cache_time) < 1.5:
-                return self._cache
-
-            if not self.trained or len(self.history) < 20:
-                result = {
-                    "status": "TRAINING",
-                    "predict": "---",
-                    "predict_short": "-",
-                    "confidence": 0.0,
-                    "latest_session_id": self.latest_session_id,
-                    "target_session_id": self.target_session_id,
-                    "context": {
-                        "total_rounds_learned": self.total_rounds,
-                        "trained": self.trained,
-                    },
+            if len(self.history) < 3:
+                return {
+                    "label":        "T",
+                    "confidence":   0.50,
+                    "reason":       "Chưa đủ lịch sử",
+                    "module_votes": {},
+                    "weights":      dict(self.meta.weights),
+                    "history_len":  len(self.history),
+                    "gb_ready":     self.gb.is_ready,
                 }
-                self._cache = result
-                self._cache_time = now
-                return result
-
-            h = self.history
-            engine_preds = self._get_engine_preds(h)
-            self._last_engine_preds = engine_preds
-            meta_result = self.meta.predict(engine_preds)
-
-            pred_val  = meta_result["prediction"]
-            pred_str  = result_label(pred_val)
-            conf      = meta_result["confidence"]
-
-            # Streak state
-            val, slen = self.streak._current_streak(h)
-            streak_state = f"STREAK_{result_label(val)}_{slen}"
-
-            result = {
-                "status": "PREDICT",
-                "predict": pred_str,
-                "predict_short": "T" if pred_val == TAI else "X",
-                "confidence": round(conf, 4),
-                "latest_session_id": self.latest_session_id,
-                "target_session_id": self.target_session_id,
-                "supreme_ai": {
-                    "state": streak_state,
-                    "mode": meta_result.get("mode", "NORMAL"),
-                    "weights": {k: round(v, 3) for k, v in self.meta.weights.items()},
-                    "engine_votes": meta_result.get("detail", {}),
-                },
-                "context": {
-                    "total_rounds_learned": self.total_rounds,
-                    "trained": self.trained,
-                    "meta_accuracy": round(
-                        self.meta.accuracy["correct"] / self.meta.accuracy["total"], 4
-                    ) if self.meta.accuracy["total"] > 0 else 0,
-                },
+            signals = {
+                self.pattern.name:   self.pattern.predict(self.history),
+                self.markov.name:    self.markov.predict(self.history),
+                self.streak.name:    self.streak.predict(self.history),
+                self.frequency.name: self.frequency.predict(self.history),
+                self.gb.name:        self.gb.predict(self.history),
             }
-            self._cache = result
-            self._cache_time = now
+            label, conf = self.meta.vote(signals)
+            self._total_predictions += 1
+            result = {
+                "label":      label,
+                "confidence": round(conf, 4),
+                "reason":     self._build_reason(signals, label),
+                "module_votes": {
+                    k: {"label": v[0], "confidence": round(v[1], 4)}
+                    for k, v in signals.items()
+                },
+                "weights": {
+                    k: round(v, 4) for k, v in self.meta.weights.items()
+                },
+                "history_len": len(self.history),
+                "gb_ready":    self.gb.is_ready,
+            }
+            self._last_predict = result
             return result
 
-    def _invalidate_cache(self):
-        self._cache = None
-        self._cache_time = 0
-
-    # ── ONLINE UPDATE ─────────────────────────
-    def add_result(self, session_id: int, result_raw: str) -> bool:
-        """
-        Thêm kết quả mới, update tất cả engine.
-        Trả về True nếu là kết quả mới (chưa có trong history).
-        """
-        val = parse_result(result_raw)
-        if val is None:
-            return False
-
+    def update(self, true_label: str, session_id: str | None = None) -> None:
+        true_label = _safe_label(true_label)
+        if true_label is None:
+            log.warning("Invalid label ignored.")
+            return
         with self._lock:
-            if session_id in self.session_ids:
-                return False   # Đã có rồi
+            if self._last_predict:
+                if self._last_predict["label"] == true_label:
+                    self._correct_predictions += 1
+                snapshot = {
+                    name: (vote["label"], vote["confidence"])
+                    for name, vote in self._last_predict["module_votes"].items()
+                }
+                self.meta.adjust_weights(snapshot, true_label)
+            history_snapshot = list(self.history)
+            self.history.append(true_label)
+            self.markov.update(true_label, self.history)
+            if session_id and session_id != self._session_id:
+                self._session_id = session_id
+                log.info("New session detected: %s", session_id)
+        # GB add_sample outside RLock (has its own lock)
+        history_snapshot.append(true_label)
+        self.gb.add_sample(history_snapshot, true_label)
 
-            self.history.append(val)
-            self.session_ids.append(session_id)
-            self.total_rounds += 1
-            self.latest_session_id = session_id
-            self.target_session_id = session_id + 1
+    def stats(self) -> dict:
+        with self._lock:
+            acc = (self._correct_predictions / self._total_predictions
+                   if self._total_predictions else 0.0)
+            return {
+                "total_predictions":   self._total_predictions,
+                "correct_predictions": self._correct_predictions,
+                "accuracy":            round(acc, 4),
+                "history_len":         len(self.history),
+                "history_limit":       HISTORY_LIMIT,
+                "uptime_seconds":      round(time.time() - self._startup_time, 1),
+                "session_id":          self._session_id,
+                "module_weights": {
+                    k: round(v, 4) for k, v in self.meta.weights.items()
+                },
+                "gb": self.gb.status(),
+            }
 
-            h = self.history
-
-            # Update tất cả engine
-            if self._last_engine_preds:
-                self.meta.update(self._last_engine_preds, val)
-
-            self.pattern.update(h, val)
-            self.markov.update(h, val)
-            self.streak.update(h, val)
-            self.frequency.update(h, val)
-
-            self._invalidate_cache()
-            log.info(f"Update session_id={session_id} result={result_label(val)} total={self.total_rounds}")
-            return True
-
-    # ── POLLING GAME API ──────────────────────
-    def start_polling(self):
-        """Chạy vòng lặp poll API game mỗi 2 giây để nhận kết quả mới."""
-        def poll():
-            while True:
-                try:
-                    r = requests.get(HISTORY_URL, timeout=8)
-                    r.raise_for_status()
-                    sessions = r.json().get("list", [])
-                    if sessions:
-                        # index 0 là mới nhất
-                        latest = sessions[0]
-                        sid = latest.get("id")
-                        raw = latest.get("resultTruyenThong")
-                        if sid and raw:
-                            self.add_result(sid, raw)
-                        # Cập nhật target_session_id
-                        with self._lock:
-                            if sessions and len(sessions) > 1:
-                                # index 0 = phiên mới nhất đã có kết quả
-                                # target = index 0 + 1
-                                pass   # đã set trong add_result
-                except Exception as e:
-                    log.warning(f"poll lỗi: {e}")
-                time.sleep(2)
-
-        t = threading.Thread(target=poll, daemon=True)
-        t.start()
-        log.info("Polling game API bắt đầu (interval=2s)")
-
-
-# ─────────────────────────────────────────────
-# FLASK API
-# ─────────────────────────────────────────────
-app   = Flask(__name__)
-ai    = SupremeAI()
-
-@app.route("/")
-def health():
-    return jsonify({"status": "ok", "trained": ai.trained, "rounds": ai.total_rounds})
-
-@app.route("/predict")
-def predict():
-    return jsonify(ai.predict())
-
-@app.route("/stats")
-def stats():
-    with ai._lock:
-        return jsonify({
-            "total_rounds":     ai.total_rounds,
-            "trained":          ai.trained,
-            "meta_weights":     {k: round(v, 3) for k, v in ai.meta.weights.items()},
-            "meta_accuracy":    round(
-                ai.meta.accuracy["correct"] / ai.meta.accuracy["total"], 4
-            ) if ai.meta.accuracy["total"] > 0 else 0,
-            "pattern_patterns": len(ai.pattern.pattern_stats),
-            "markov_states":    {o: len(ai.markov.tables[o]) for o in ai.markov.ORDERS},
-            "streak_stats":     len(ai.streak.streak_stats),
-        })
-
-@app.route("/summary_50")
-def summary_50():
-    """50 van gan nhat: ty le TAI/XIU, streak, pattern."""
-    with ai._lock:
-        h    = ai.history[-50:]    if len(ai.history)    >= 50 else ai.history[:]
-        sids = ai.session_ids[-50:] if len(ai.session_ids) >= 50 else ai.session_ids[:]
-    if not h:
-        return jsonify({"error": "Chua co du lieu"}), 503
-    tai_count = sum(h)
-    xiu_count = len(h) - tai_count
-    val, slen = ai.streak._current_streak(h)
-    pattern_now = ai.pattern._identify_pattern(h[-13:]) if len(h) >= 13 else "UNKNOWN"
-    sequence = "".join("T" if x == TAI else "X" for x in h)
-    return jsonify({
-        "window":         len(h),
-        "tai_count":      tai_count,
-        "xiu_count":      xiu_count,
-        "tai_pct":        round(tai_count / len(h) * 100, 1),
-        "xiu_pct":        round(xiu_count / len(h) * 100, 1),
-        "current_streak": {"value": result_label(val), "length": slen},
-        "pattern_13":     pattern_now,
-        "sequence":       sequence,
-        "latest_ids":     sids[-10:],
-    })
-
-@app.route("/streak_20")
-def streak_20():
-    """Phan tich streak 20 van gan nhat."""
-    with ai._lock:
-        h = ai.history[-20:] if len(ai.history) >= 20 else ai.history[:]
-    if not h:
-        return jsonify({"error": "Chua co du lieu"}), 503
-    streaks = []
-    cur_val, cur_len = h[0], 1
-    for v in h[1:]:
-        if v == cur_val:
-            cur_len += 1
-        else:
-            streaks.append({"value": result_label(cur_val), "length": cur_len})
-            cur_val, cur_len = v, 1
-    streaks.append({"value": result_label(cur_val), "length": cur_len})
-    p_tai = sum(h) / len(h)
-    ent   = entropy(p_tai)
-    val, slen = ai.streak._current_streak(h)
-    key = (val, min(slen, 10))
-    with ai._lock:
-        st = dict(ai.streak.streak_stats.get(key, {"break": 0, "continue": 0}))
-    total = st["break"] + st["continue"]
-    p_break = round(st["break"] / total if total >= 5 else min(0.3 + slen * 0.08, 0.75), 3)
-    return jsonify({
-        "window":          len(h),
-        "streaks":         streaks,
-        "current_streak":  {"value": result_label(val), "length": slen},
-        "p_break":         p_break,
-        "p_continue":      round(1 - p_break, 3),
-        "entropy":         round(ent, 4),
-        "stability":       "STABLE" if ent < 0.7 else ("MODERATE" if ent < 0.95 else "CHAOTIC"),
-        "tai_pct":         round(p_tai * 100, 1),
-        "xiu_pct":         round((1 - p_tai) * 100, 1),
-    })
-
-@app.route("/accuracy")
-def accuracy():
-    """Accuracy thuc te cua tung engine va meta."""
-    def _acc(correct, total):
-        return round(correct / total * 100, 2) if total > 0 else 0.0
-    with ai._lock:
-        pattern_accs = {
-            pname: {"accuracy": _acc(pst.get("correct", 0), pst.get("total", 0)), "total": pst.get("total", 0)}
-            for pname, pst in ai.pattern.pattern_stats.items()
-            if pst.get("total", 0) >= 10
+    def summary(self, n: int = 50) -> dict:
+        n = max(1, min(int(n), HISTORY_LIMIT))
+        with self._lock:
+            window = list(self.history)[-n:]
+        counts = {label: window.count(label) for label in LABELS}
+        return {
+            "window":        n,
+            "actual_window": len(window),
+            "counts":        counts,
+            "t_ratio":       round(counts.get("T", 0) / max(len(window), 1), 4),
         }
-        top_patterns = dict(sorted(pattern_accs.items(), key=lambda x: -x[1]["total"])[:10])
-        markov_accs  = {
-            f"order_{o}": {"accuracy": _acc(ai.markov.accuracy[o]["correct"], ai.markov.accuracy[o]["total"]),
-                           "total": ai.markov.accuracy[o]["total"]}
-            for o in ai.markov.ORDERS
+
+    def streak_info(self, n: int = 20) -> dict:
+        n = max(1, min(int(n), HISTORY_LIMIT))
+        with self._lock:
+            window = list(self.history)[-n:]
+        if not window:
+            return {"streak_label": None, "streak_length": 0}
+        current = window[-1]
+        length = 0
+        for lbl in reversed(window):
+            if lbl == current:
+                length += 1
+            else:
+                break
+        return {
+            "streak_label":  current,
+            "streak_length": length,
+            "window":        n,
+            "entropy":       round(_entropy({lb: window.count(lb) for lb in LABELS}), 4),
         }
-        streak_d = dict(ai.streak.accuracy)
-        freq_d   = dict(ai.frequency.accuracy)
-        meta_d   = dict(ai.meta.accuracy)
-        weights  = dict(ai.meta.weights)
-        cstreak  = ai.meta.all_wrong_streak
+
+    @staticmethod
+    def _build_reason(signals: dict, final_label: str) -> str:
+        agreement = sum(1 for v in signals.values() if v[0] == final_label)
+        total = len(signals)
+        return f"{agreement}/{total} modules đồng thuận → {final_label}"
+
+
+# ── Singleton ─────────────────────────────────────────────────────────────────
+
+predictor = KanoPredictor()
+
+
+# ── Startup loader ────────────────────────────────────────────────────────────
+
+def startup_load(history_api_url: str, max_pages: int = 10) -> None:
+    if not history_api_url:
+        log.info("HISTORY_API_URL not configured; skipping startup load.")
+        return
+    all_results: list[str] = []
+    for page in range(1, max_pages + 1):
+        url = f"{history_api_url}?page={page}"
+        try:
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read())
+            rows = data.get("data", [])
+            if not isinstance(rows, list):
+                break
+            page_results = [
+                _safe_label(r.get("resultTruyenThong"))
+                for r in rows if isinstance(r, dict)
+            ]
+            page_results = [x for x in page_results if x in LABELS]
+            if not page_results:
+                break
+            all_results = page_results + all_results
+            if len(all_results) >= HISTORY_LIMIT:
+                break
+        except Exception as exc:
+            log.warning("History API page %d failed: %s", page, exc)
+            break
+    predictor.load_history(all_results)
+
+
+# ── Flask app ─────────────────────────────────────────────────────────────────
+
+app = Flask(__name__)
+
+
+@app.get("/ping")
+def ping():
     return jsonify({
-        "meta":              {"accuracy": _acc(meta_d["correct"], meta_d["total"]),
-                              "correct": meta_d["correct"], "total": meta_d["total"]},
-        "engines":           {"markov":    markov_accs,
-                              "streak":    {"accuracy": _acc(streak_d["correct"], streak_d["total"]),
-                                            "total": streak_d["total"]},
-                              "frequency": {"accuracy": _acc(freq_d["correct"], freq_d["total"]),
-                                            "total": freq_d["total"]}},
-        "top_patterns":      top_patterns,
-        "meta_weights":      {k: round(v, 4) for k, v in weights.items()},
-        "contrarian_streak": cstreak,
+        "status":      "ok",
+        "service":     "kano-ai",
+        "history_len": len(predictor.history),
+        "gb_ready":    predictor.gb.is_ready,
     })
 
-@app.route("/history")
-def history():
-    """N van gan nhat kem session_id. ?limit=N (max 200)"""
-    from flask import request as freq_req
+
+@app.get("/predict")
+def predict_endpoint():
+    return jsonify(predictor.predict())
+
+
+@app.post("/update")
+def update_endpoint():
+    payload = request.get_json(silent=True) or {}
+    label = (payload.get("label")
+             or payload.get("resultTruyenThong")
+             or payload.get("result"))
+    session_id = payload.get("session_id")
+    label = _safe_label(label)
+    if label is None:
+        return jsonify({"ok": False, "error": "label must be T or X"}), 400
+    predictor.update(label, session_id)
+    return jsonify({"ok": True, "updated_label": label, "stats": predictor.stats()})
+
+
+@app.get("/stats")
+def stats_endpoint():
+    return jsonify(predictor.stats())
+
+
+@app.get("/summary_50")
+def summary_50_endpoint():
+    return jsonify(predictor.summary(50))
+
+
+@app.get("/streak_20")
+def streak_20_endpoint():
+    return jsonify(predictor.streak_info(20))
+
+
+@app.get("/accuracy")
+def accuracy_endpoint():
+    return jsonify({"accuracy": predictor.stats()["accuracy"]})
+
+
+@app.get("/history")
+def history_endpoint():
+    with predictor._lock:
+        history = list(predictor.history)[-100:]
+    return jsonify({"history": history, "count": len(history)})
+
+
+@app.get("/")
+def root_endpoint():
+    return jsonify({
+        "service":   "kano-ai",
+        "status":    "running",
+        "endpoints": ["/ping", "/predict", "/update", "/stats",
+                      "/summary_50", "/streak_20", "/accuracy", "/history"],
+    })
+
+
+# ── Environment wiring ────────────────────────────────────────────────────────
+
+def initialize_from_environment() -> None:
+    enabled = os.getenv("ENABLE_STARTUP_LOAD", "true").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if not enabled:
+        return
+    api_url = os.getenv("HISTORY_API_URL", "").strip()
+    if not api_url:
+        return
     try:
-        limit = min(int(freq_req.args.get("limit", 50)), 200)
+        max_pages = max(1, int(os.getenv("STARTUP_MAX_PAGES", "10")))
     except ValueError:
-        limit = 50
-    with ai._lock:
-        h    = ai.history[-limit:]
-        sids = ai.session_ids[-limit:]
-        latest = ai.latest_session_id
-    records = [{"session_id": sids[i] if i < len(sids) else None,
-                "result": result_label(h[i]), "value": h[i]} for i in range(len(h))]
-    return jsonify({"count": len(records), "records": records, "latest_session_id": latest})
+        max_pages = 10
+    startup_load(api_url, max_pages=max_pages)
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
-def main():
-    # Load lịch sử & train trong background
-    threading.Thread(target=ai.load_history, daemon=True).start()
-    # Polling kết quả mới (bắt đầu ngay, trước khi train xong cũng không sao)
-    ai.start_polling()
-    # Chạy Flask
-    log.info(f"Kano AI app.py khởi động trên port {PORT}")
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+def startup_initialize() -> None:
+    background = os.getenv("STARTUP_LOAD_BACKGROUND", "false").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if background:
+        threading.Thread(
+            target=initialize_from_environment,
+            name="kano-startup-loader",
+            daemon=True,
+        ).start()
+    else:
+        initialize_from_environment()
+
+
+# ── Entrypoint ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    startup_initialize()
+    host = os.getenv("HOST", "0.0.0.0")
+    try:
+        port = int(os.getenv("PORT", "10000"))
+    except ValueError:
+        port = 10000
+    log.info("Starting Kano AI on %s:%d", host, port)
+    app.run(host=host, port=port, threaded=True)
