@@ -21,6 +21,9 @@ def health():
     return "Kano AI Bot is running.", 200
 
 def run_flask():
+    # FIX: dùng PORT+1 để tránh conflict với gunicorn trên cùng PORT
+    # Bot chạy bằng `python bot.py` nên gunicorn không can thiệp.
+    # PORT vẫn dùng được vì bot.py tự chạy Flask, không qua gunicorn.
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
@@ -34,10 +37,14 @@ def self_ping():
             log.info("Self-ping OK")
         except Exception as e:
             log.warning(f"Self-ping lỗi: {e}")
-        _t.sleep(600)
+        # FIX: giảm từ 600s (10 phút) xuống 240s (4 phút)
+        # Render Free spin down sau 15 phút không có request.
+        # 4 phút đảm bảo luôn có traffic trước khi đến ngưỡng.
+        _t.sleep(240)
 
 # ===== CẤU HÌNH =====
-TOKEN          = "8891039285:AAGuzG0fdsycHSsIhogbth3dvnzE16PTziw"
+# FIX: Token mới — token cũ đã bị lộ, revoke ngay trên BotFather
+TOKEN          = os.environ.get("BOT_TOKEN", "8891039285:AAF1zU82-TaJ2cnVIh3WJjrZvC6wx2PsgZI")
 PREDICT_URL    = "https://bettv-predictor.onrender.com/predict"
 HISTORY_URL    = (
     "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
@@ -56,11 +63,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ===== BỘ NHỚ =====
-user_data     = {}   # uid -> dict
-user_sessions = {}   # uid -> dict
+user_data     = {}
+user_sessions = {}
 
 # ===== KEYBOARDS =====
-# Menu chính — luôn hiển thị
 MENU_KB = ReplyKeyboardMarkup([
     ["🎮 KHU VỰC GAME",  "👤 HỒ SƠ"],
     ["🔑 MUA GÓI KEY",   "✅ KÍCH HOẠT KEY"],
@@ -68,14 +74,12 @@ MENU_KB = ReplyKeyboardMarkup([
     ["📝 FEEDBACK",      "📢 KÊNH THÔNG BÁO"],
 ], resize_keyboard=True)
 
-# Keyboard sau khi chọn game — có nút AUTO
 GAME_KB = ReplyKeyboardMarkup([
     ["⏹ DỪNG DỰ ĐOÁN"],
     ["🤖 BẬT AUTO DỰ ĐOÁN"],
     ["🔙 QUAY LẠI MENU"],
 ], resize_keyboard=True)
 
-# Keyboard khi AUTO đang chạy
 AUTO_KB = ReplyKeyboardMarkup([
     ["⏹ DỪNG AUTO"],
     ["🔙 QUAY LẠI MENU"],
@@ -150,7 +154,6 @@ def ensure_user(uid, username=""):
         }
     if is_admin(uid, username):
         admin_balance = ADMINS.get(uid, {}).get("balance", 10_000_000)
-        # Chỉ set balance nếu chưa set hoặc thấp hơn mức admin
         if user_data[uid]["balance"] < admin_balance:
             user_data[uid]["balance"] = admin_balance
         user_data[uid]["key"]        = "ADMIN_UNLIMITED"
@@ -188,7 +191,6 @@ def fetch_game_sessions():
         return []
 
 def get_latest_finished(sessions):
-    """Phiên mới nhất đã có kết quả thật."""
     for s in sessions:
         if s.get("resultTruyenThong"):
             return s
@@ -280,7 +282,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ensure_user(uid, uname)
     text  = update.message.text
 
-    # Nút trên GAME_KB / AUTO_KB
     if text == "⏹ DỪNG DỰ ĐOÁN":
         await do_stop(update, context, uid)
         return
@@ -298,7 +299,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Menu chính
     routes = {
         "🎮 KHU VỰC GAME":   show_game_area,
         "👤 HỒ SƠ":          show_profile,
@@ -326,17 +326,12 @@ async def show_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
-# ===== KHỞI ĐỘNG DỰ ĐOÁN (core) =====
+# ===== KHỞI ĐỘNG DỰ ĐOÁN =====
 async def _launch(uid, chat_id, context, send_fn, auto_mode=False):
-    """
-    Khởi động session dự đoán.
-    send_fn: async (text, reply_markup) -> Message
-    """
     _cancel_job(context, uid)
     session = new_session(chat_id, auto_mode=auto_mode)
     user_sessions[uid] = session
 
-    # Lấy trạng thái game hiện tại
     game_sessions = fetch_game_sessions()
     if game_sessions:
         finished = get_latest_finished(game_sessions)
@@ -390,7 +385,7 @@ async def cb_game_betvip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await _launch(uid, query.message.chat_id, context, send_fn, auto_mode=False)
 
-# ===== BẬT AUTO (từ nút keyboard) =====
+# ===== BẬT AUTO =====
 async def do_start_auto(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
     uname = update.effective_user.username or ""
     ensure_user(uid, uname)
@@ -415,7 +410,7 @@ async def do_start_auto(update: Update, context: ContextTypes.DEFAULT_TYPE, uid:
 
     await _launch(uid, update.message.chat_id, context, send_fn, auto_mode=True)
 
-# ===== DỪNG DỰ ĐOÁN THƯỜNG =====
+# ===== DỪNG =====
 async def do_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
     _deactivate(uid)
     _cancel_job(context, uid)
@@ -425,7 +420,6 @@ async def do_stop(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
         reply_markup=GAME_KB
     )
 
-# ===== DỪNG AUTO =====
 async def do_stop_auto(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
     _deactivate(uid)
     _cancel_job(context, uid)
@@ -435,15 +429,8 @@ async def do_stop_auto(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: 
         reply_markup=GAME_KB
     )
 
-# ===== AUTO JOB (2 giây/lần) =====
+# ===== AUTO JOB =====
 async def auto_predict_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Mỗi 2 giây:
-    - Poll API game, lấy phiên mới nhất đã có kết quả.
-    - Nếu ID thay đổi → phiên mới vừa ra kết quả
-      → fetch dự đoán mới và gửi tin ngay.
-    - Nếu cùng phiên → chỉ edit cập nhật giờ (không gọi predict API).
-    """
     uid     = context.job.user_id
     session = user_sessions.get(uid)
     if not session or not session["active"]:
@@ -471,14 +458,12 @@ async def auto_predict_job(context: ContextTypes.DEFAULT_TYPE):
     )
 
     if is_new:
-        # Kết quả mới vừa ra — cập nhật phiên trước
         session["prev_session"] = str(current_latest)
         session["prev_result"]  = finished.get("resultTruyenThong") or "---"
         session["prev_dices"]   = finished.get("dices")
         session["prev_point"]   = finished.get("point")
         session["known_latest"] = current_latest
 
-        # Fetch dự đoán phiên tiếp theo
         predict_data = fetch_predict()
         if not predict_data or predict_data.get("status") == "TRAINING":
             session["last_predict"] = predict_data
@@ -499,9 +484,7 @@ async def auto_predict_job(context: ContextTypes.DEFAULT_TYPE):
             log.info(f"uid={uid} gửi dự đoán phiên mới latest={current_latest}")
         except Exception as e:
             log.error(f"auto_predict_job send lỗi uid={uid}: {e}")
-
     else:
-        # Cùng phiên — chỉ edit cập nhật giờ
         if known_latest is None and current_latest is not None:
             session["known_latest"] = current_latest
 
@@ -586,12 +569,10 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin = is_admin(uid, uname)
 
-    # Kiểm tra tân thủ đã dùng
     if pkg.get("one_time") and user_data[uid].get("tan_thu_used") and not admin:
         await query.answer("Bạn đã sử dụng gói Tân Thủ rồi!", show_alert=True)
         return
 
-    # Kiểm tra số dư (gói free thì bỏ qua)
     if not admin and pkg["price"] > 0:
         if user_data[uid]["balance"] < pkg["price"]:
             await query.answer(
@@ -714,9 +695,8 @@ async def generate_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# ===== LỆNH NẠP TIỀN CHO ADMIN =====
+# ===== LỆNH NẠP TIỀN ADMIN =====
 async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /naptien <user_id> <so_tien>"""
     uid   = update.effective_user.id
     uname = update.effective_user.username or ""
     if not is_admin(uid, uname):
@@ -773,7 +753,7 @@ async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     except Exception as e:
-        log.warning(f"Không thể gửi thông báo nạp tiền cho uid={target_uid}: {e}")
+        log.warning(f"Không thể gửi thông báo cho uid={target_uid}: {e}")
 
 # ===== FEEDBACK & THÔNG BÁO =====
 async def feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -796,7 +776,15 @@ async def thongbao(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== MAIN =====
 def main():
-    app = Application.builder().token(TOKEN).build()
+    # Validate token trước khi chạy
+    token = os.environ.get("BOT_TOKEN", "")
+    if not token or token == "PASTE_TOKEN_MOI_VAO_ENV_RENDER":
+        raise RuntimeError(
+            "BOT_TOKEN chưa được set! "
+            "Vào Render → Environment → thêm BOT_TOKEN = <token mới từ BotFather>"
+        )
+
+    app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("active",  cmd_active))
@@ -812,7 +800,7 @@ def main():
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
 
-    log.info("Bot Kano AI v8 đang chạy...")
+    log.info("Bot Kano AI đang chạy...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
