@@ -99,10 +99,19 @@ def _normalize_weights(weights: dict) -> dict:
 
 
 def _safe_label(value) -> str | None:
+    """
+    Chuyển đổi giá trị từ API về T hoặc X.
+    API game trả về: "TAI", "TÀI", "T" → "T"
+                     "XIU", "XỈU", "X" → "X"
+    """
     if value is None:
         return None
     label = str(value).strip().upper()
-    return label if label in LABELS else None
+    if label in ("TAI", "TÀI", "T", "OVER"):
+        return "T"
+    if label in ("XIU", "XỈU", "X", "UNDER"):
+        return "X"
+    return None
 
 
 # ── Module base ───────────────────────────────────────────────────────────────
