@@ -44,7 +44,7 @@ def self_ping():
 
 # ===== CẤU HÌNH =====
 # FIX: Token mới — token cũ đã bị lộ, revoke ngay trên BotFather
-TOKEN          = os.environ.get("BOT_TOKEN", "8891039285:AAExKcnxrITyL7MEzN8mvshpEfa4evodvsk")
+TOKEN          = os.environ.get("BOT_TOKEN", "PASTE_TOKEN_MOI_VAO_ENV_RENDER")
 PREDICT_URL    = "https://bettv-predictor.onrender.com/predict"
 HISTORY_URL    = (
     "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
@@ -209,10 +209,16 @@ def build_ui(session, predict_data):
     sep = "━" * 22
     auto_tag = "🤖 AUTO · " if session.get("auto_mode") else ""
 
-    if predict_data and predict_data.get("status") == "PREDICT":
-        target_id              = str(predict_data["target_session_id"])
-        pred_label, pred_emoji = label_result(predict_data.get("predict", "").upper())
-        conf                   = predict_data["confidence_pct"]
+    # FIX: engine mới trả label trực tiếp, không dùng status==PREDICT
+    has_prediction = (
+        predict_data is not None
+        and predict_data.get("label") in ("T", "X")
+        and predict_data.get("history_len", 0) > 0
+    )
+    if has_prediction:
+        target_id              = str(predict_data.get("target_session_id", "---"))
+        pred_label, pred_emoji = label_result(predict_data.get("label", ""))
+        conf                   = predict_data.get("confidence_pct", 0.0)
         is_ready               = True
     else:
         target_id  = "---"
