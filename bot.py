@@ -216,7 +216,12 @@ def build_ui(session, predict_data):
         and predict_data.get("history_len", 0) > 0
     )
     if has_prediction:
-        target_id              = str(predict_data.get("target_session_id", "---"))
+        # Phiên tiếp theo = phiên trước + 1
+        prev = session.get("prev_session", "---")
+        try:
+            target_id = str(int(prev) + 1)
+        except (ValueError, TypeError):
+            target_id = "---"
         pred_label, pred_emoji = label_result(predict_data.get("label", ""))
         conf                   = predict_data.get("confidence_pct", 0.0)
         is_ready               = True
@@ -240,7 +245,7 @@ def build_ui(session, predict_data):
         f"   {auto_tag}🏆 *KANO AI* · BetVip\n"
         f"╚══════════════════════╝\n\n"
         f"{sep}\n"
-        f"📡 *DỰ ĐOÁN PHIÊN TIẾP THEO*\n"
+        f"📡 *DỰ ĐOÁN*\n"
         f"{sep}\n"
         f"🔢 Phiên:   `#{target_id}`\n"
         f"{pred_emoji} Kết quả:  *{pred_label}*\n\n"
