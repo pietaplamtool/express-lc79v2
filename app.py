@@ -779,32 +779,59 @@ predictor = KanoPredictor()
 # ── Startup loader ────────────────────────────────────────────────────────────
 
 def startup_load(history_api_url: str, max_pages: int = 10) -> None:
+    """
+    Load lịch sử từ API game khi khởi động.
+
+    Fix v4.1:
+      [1] API trả về key "list", không phải "data" — đã sửa.
+      [2] API trả 403 khi không có browser header — đã thêm User-Agent.
+      [3] URL đã có params sẵn → không append thêm ?page= nữa, chỉ dùng URL gốc.
+    """
     if not history_api_url:
         log.info("HISTORY_API_URL not configured; skipping startup load.")
         return
+
+    # Header giả browser để tránh 403 Forbidden
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://bettv-predictor.onrender.com/",
+    }
+
     all_results: list[str] = []
-    for page in range(1, max_pages + 1):
-        url = f"{history_api_url}?page={page}"
-        try:
-            with urllib.request.urlopen(url, timeout=10) as resp:
-                data = json.loads(resp.read())
-            rows = data.get("data", [])
-            if not isinstance(rows, list):
-                break
-            page_results = [
-                _safe_label(r.get("resultTruyenThong"))
-                for r in rows if isinstance(r, dict)
-            ]
-            page_results = [x for x in page_results if x in LABELS]
-            if not page_results:
-                break
-            all_results = page_results + all_results
-            if len(all_results) >= HISTORY_LIMIT:
-                break
-        except Exception as exc:
-            log.warning("History API page %d failed: %s", page, exc)
-            break
-    predictor.load_history(all_results)
+
+    # API này không hỗ trợ pagination — chỉ gọi 1 lần với URL gốc
+    try:
+        req = urllib.request.Request(history_api_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+
+        # API trả về {"list": [...], "typeStat": {...}}
+        # Thử cả "list" và "data" để tương thích
+        rows = data.get("list") or data.get("data") or []
+        if not isinstance(rows, list):
+            log.warning("startup_load: API response không có key list/data.")
+            return
+
+        all_results = [
+            _safe_label(r.get("resultTruyenThong"))
+            for r in rows if isinstance(r, dict)
+        ]
+        all_results = [x for x in all_results if x in LABELS]
+        log.info("startup_load: lấy được %d kết quả từ API.", len(all_results))
+
+    except Exception as exc:
+        log.warning("startup_load failed: %s", exc)
+        return
+
+    if all_results:
+        predictor.load_history(all_results)
+    else:
+        log.warning("startup_load: không lấy được kết quả hợp lệ nào.")
 
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
