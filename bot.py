@@ -28,18 +28,21 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 def self_ping():
+    """
+    Ping cả 2 service mỗi 4 phút để Render Free không spin down.
+    Render Free spin down sau 15 phút không có request.
+    """
     import time as _t
     _t.sleep(30)
+    bot_url      = BOT_URL or "https://bettv-telegram-bot.onrender.com"
+    predictor_url = "https://bettv-predictor.onrender.com/ping"
     while True:
-        try:
-            url = BOT_URL or "https://bettv-telegram-bot.onrender.com"
-            requests.get(url, timeout=10)
-            log.info("Self-ping OK")
-        except Exception as e:
-            log.warning(f"Self-ping lỗi: {e}")
-        # FIX: giảm từ 600s (10 phút) xuống 240s (4 phút)
-        # Render Free spin down sau 15 phút không có request.
-        # 4 phút đảm bảo luôn có traffic trước khi đến ngưỡng.
+        for url in [bot_url, predictor_url]:
+            try:
+                requests.get(url, timeout=10)
+                log.info(f"Self-ping OK: {url}")
+            except Exception as e:
+                log.warning(f"Self-ping lỗi {url}: {e}")
         _t.sleep(240)
 
 # ===== CẤU HÌNH =====
@@ -476,10 +479,14 @@ async def auto_predict_job(context: ContextTypes.DEFAULT_TYPE):
         session["known_latest"] = current_latest
 
         predict_data = fetch_predict()
-        if not predict_data or predict_data.get("status") == "TRAINING":
-            session["last_predict"] = predict_data
-            log.info(f"uid={uid} phiên mới={current_latest} nhưng AI đang training")
+        # Engine mới trả label trực tiếp, không có status field
+        if not predict_data:
+            log.info(f"uid={uid} phiên mới={current_latest} nhưng predict API lỗi")
             return
+        # Chuyển confidence sang % nếu chưa có confidence_pct
+        if "confidence_pct" not in predict_data and "confidence" in predict_data:
+            c = float(predict_data.get("confidence", 0))
+            predict_data["confidence_pct"] = round(c * 100 if c <= 1.0 else c, 1)
 
         session["last_predict"] = predict_data
         text = build_ui(session, predict_data)
