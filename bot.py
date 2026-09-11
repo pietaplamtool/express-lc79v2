@@ -305,6 +305,16 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "⏹ DỪNG AUTO":
         await do_stop_auto(update, context, uid)
         return
+    # Baccarat buttons
+    if text == "⏹ DỪNG DỰ ĐOÁN BAC":
+        await do_stop_bac(update, context, uid)
+        return
+    if text == "🤖 BẬT AUTO BAC":
+        await do_start_auto_bac(update, context, uid)
+        return
+    if text == "⏹ DỪNG AUTO BAC":
+        await do_stop_auto_bac(update, context, uid)
+        return
     if text == "🔙 QUAY LẠI MENU":
         _deactivate(uid)
         _cancel_job(context, uid)
@@ -332,10 +342,11 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== KHU VỰC GAME =====
 async def show_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎮 *KHU VỰC GAME*\n\nHiện tại hỗ trợ game BetVip.\nChọn game để bắt đầu:",
+        "🎮 *KHU VỰC GAME*\n\nChọn game để bắt đầu:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ BetVip", callback_data="game_betvip")],
+            [InlineKeyboardButton("⭐ BetVip Tài/Xỉu", callback_data="game_betvip")],
+            [InlineKeyboardButton("🃏 Baccarat", callback_data="game_baccarat")],
             [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")],
         ])
     )
@@ -792,6 +803,429 @@ async def thongbao(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     )
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BACCARAT MODULE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+BACCARAT_API_URL = "https://kkvgvbcrj.onrender.com/api/fullban"
+
+# ── Baccarat AI Engine ────────────────────────────────────────────────────────
+
+def _bac_safe(v):
+    if v is None: return None
+    s = str(v).strip().upper()
+    return s if s in ("P","B","T") else None
+
+def _bac_entropy(counts):
+    total = sum(counts.values())
+    if total == 0: return 0.0
+    import math
+    return -sum((c/total)*math.log2(c/total) for c in counts.values() if c > 0)
+
+def _bac_clamp(v, lo, hi): return max(lo, min(hi, v))
+
+def _bac_bat_nhip(history):
+    """AI Bắt nhịp: phát hiện pattern lặp PBPB, BBPP..."""
+    seq = [x for x in history if x != "T"]
+    if len(seq) < 4: return "B", 0.5
+    best_label = seq[-1]; best_score = 0.0
+    for plen in [2, 3, 4]:
+        if len(seq) < plen * 2: continue
+        pattern = tuple(seq[-plen:])
+        count = sum(1 for i in range(len(seq)-plen) if tuple(seq[i:i+plen]) == pattern)
+        freq = count / max(1, len(seq) - plen)
+        if freq > best_score:
+            best_score = freq
+            best_label = pattern[len(seq) % plen] if freq > 0.3 else seq[-1]
+    return best_label, _bac_clamp(best_score * 1.5, 0.3, 0.85)
+
+def _bac_theo_bet(history):
+    """AI Theo bệt: phát hiện streak và theo."""
+    seq = [x for x in history if x != "T"]
+    if not seq: return "B", 0.5
+    current = seq[-1]; streak = 0
+    for x in reversed(seq):
+        if x == current: streak += 1
+        else: break
+    return current, _bac_clamp(0.45 + streak * 0.06, 0.45, 0.82)
+
+def _bac_be_bet(history):
+    """AI Bẻ bệt: khi streak >= 4 dự đoán sẽ bẻ."""
+    seq = [x for x in history if x != "T"]
+    if len(seq) < 6: return "B", 0.5
+    window = seq[-10:]; current = window[-1]; streak = 0
+    for x in reversed(window):
+        if x == current: streak += 1
+        else: break
+    if streak >= 4:
+        opposite = "P" if current == "B" else "B"
+        return opposite, _bac_clamp(0.5 + (streak-3)*0.08, 0.5, 0.85)
+    return current, 0.48
+
+def _bac_tie_prob(history):
+    """AI Tie: dự đoán xác suất Hòa."""
+    if len(history) < 10: return 9.5
+    window = list(history)[-30:]
+    n = len(window)
+    base = window.count("T") / n
+    dist = 0
+    for x in reversed(window):
+        if x != "T": dist += 1
+        else: break
+    tie_p = _bac_clamp(base * 0.6 + 0.04 + min(dist/20, 0.5)*0.03, 0.03, 0.25)
+    return round(tie_p * 100, 1)
+
+def baccarat_predict_local(history_str, api_du_doan, api_tin_cay):
+    """
+    Fuse: API signal (40%) + AI Bắt nhịp (20%) + AI Theo bệt (20%) + AI Bẻ bệt (20%).
+    Trả về dict label/confidence_pct/tie_prob_pct/signals.
+    """
+    history = [_bac_safe(c) for c in history_str]
+    history = [x for x in history if x is not None]
+
+    tie_prob_pct = _bac_tie_prob(history)
+
+    l1, c1 = _bac_bat_nhip(history)
+    l2, c2 = _bac_theo_bet(history)
+    l3, c3 = _bac_be_bet(history)
+
+    api_label = _bac_safe(api_du_doan) or "B"
+    api_conf  = _bac_clamp(float(api_tin_cay or 0) / 100.0, 0.0, 1.0)
+
+    weights  = {"api": 0.40, "bat_nhip": 0.20, "theo_bet": 0.20, "be_bet": 0.20}
+    signals  = {"api": (api_label, api_conf), "bat_nhip": (l1,c1), "theo_bet": (l2,c2), "be_bet": (l3,c3)}
+
+    score_P = score_B = 0.0
+    for name, (lbl, conf) in signals.items():
+        w = weights[name]
+        if lbl == "P": score_P += w * conf
+        elif lbl == "B": score_B += w * conf
+
+    total = score_P + score_B
+    if total == 0: final_label = "B"; final_conf = 0.5
+    elif score_P >= score_B: final_label = "P"; final_conf = score_P / total
+    else: final_label = "B"; final_conf = score_B / total
+
+    if final_conf > 0.88:
+        final_label = "P" if final_label == "B" else "B"
+
+    return {
+        "label":          final_label,
+        "confidence_pct": round(final_conf * 100, 1),
+        "tie_prob_pct":   tie_prob_pct,
+        "signals":        {k: {"label": v[0], "conf_pct": round(v[1]*100,1)} for k,v in signals.items()},
+    }
+
+# ── Baccarat API ──────────────────────────────────────────────────────────────
+
+def fetch_baccarat_all():
+    """Lấy toàn bộ dữ liệu tất cả bàn."""
+    try:
+        r = requests.get(BACCARAT_API_URL, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("danh_sach", {})
+    except Exception as e:
+        log.warning(f"fetch_baccarat_all lỗi: {e}")
+        return {}
+
+def fetch_baccarat_ban(ban_id):
+    """Lấy dữ liệu 1 bàn cụ thể."""
+    try:
+        r = requests.get(BACCARAT_API_URL, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("danh_sach", {}).get(ban_id)
+    except Exception as e:
+        log.warning(f"fetch_baccarat_ban {ban_id} lỗi: {e}")
+        return None
+
+# ── Baccarat Keyboards ────────────────────────────────────────────────────────
+
+BAC_GAME_KB = ReplyKeyboardMarkup([
+    ["⏹ DỪNG DỰ ĐOÁN BAC"],
+    ["🤖 BẬT AUTO BAC"],
+    ["🔙 QUAY LẠI MENU"],
+], resize_keyboard=True)
+
+BAC_AUTO_KB = ReplyKeyboardMarkup([
+    ["⏹ DỪNG AUTO BAC"],
+    ["🔙 QUAY LẠI MENU"],
+], resize_keyboard=True)
+
+# ── Baccarat build_ui ─────────────────────────────────────────────────────────
+
+def label_bac(raw):
+    raw = (raw or "").upper()
+    if raw == "P": return "PLAYER", "🔵"
+    if raw == "B": return "BANKER", "🔴"
+    if raw == "T": return "HÒA", "🟢"
+    return raw or "---", "➖"
+
+def build_bac_ui(session, predict):
+    now    = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    sep    = "━" * 22
+    ban_id = session.get("bac_ban", "---")
+    auto_tag = "🤖 AUTO · " if session.get("auto_mode") else ""
+
+    if predict and predict.get("label") in ("P","B","T"):
+        pred_label, pred_emoji = label_bac(predict["label"])
+        conf         = predict.get("confidence_pct", 0.0)
+        tie_pct      = predict.get("tie_prob_pct", 9.5)
+        is_ready     = True
+    else:
+        pred_label = "Đang chờ dữ liệu"; pred_emoji = "⏳"
+        conf = 0.0; tie_pct = 0.0; is_ready = False
+
+    bar     = "▰" * int(conf / 100 * 12) + "▱" * (12 - int(conf / 100 * 12))
+    tie_bar = "▰" * int(tie_pct / 25 * 12) + "▱" * (12 - int(tie_pct / 25 * 12))
+
+    prev_label, prev_emoji = label_bac(session.get("bac_prev_result",""))
+    prev_seq = session.get("bac_prev_seq","")
+    seq_display = " ".join(list(prev_seq[-10:])) if prev_seq else "---"
+
+    sigs = predict.get("signals", {}) if predict else {}
+    sig_lines = ""
+    sig_names = {"api":"📡 API","bat_nhip":"🎵 Bắt nhịp","theo_bet":"📈 Theo bệt","be_bet":"✂️ Bẻ bệt"}
+    for k, v in sigs.items():
+        lbl, _ = label_bac(v.get("label",""))
+        sig_lines += f"  {sig_names.get(k,k)}: *{lbl}* {v.get('conf_pct',0):.0f}%\n"
+
+    return (
+        f"╔══════════════════════╗\n"
+        f"   {auto_tag}🃏 *KANO AI* · Baccarat\n"
+        f"╚══════════════════════╝\n\n"
+        f"{sep}\n"
+        f"🎰 *BÀN: {ban_id}*\n"
+        f"{sep}\n"
+        f"📡 *DỰ ĐOÁN*\n"
+        f"{pred_emoji} Kết quả: *{pred_label}*\n\n"
+        f"📊 *ĐỘ TIN CẬY*\n"
+        f"`{bar}` *{conf:.1f}%*\n\n"
+        f"🟢 *TỈ LỆ HÒA (AI Tie)*\n"
+        f"`{tie_bar}` *{tie_pct:.1f}%*\n\n"
+        f"{sep}\n"
+        f"🤖 *TÍN HIỆU AI*\n"
+        f"{sig_lines}"
+        f"{sep}\n"
+        f"📜 *PHIÊN TRƯỚC*\n"
+        f"{prev_emoji} Kết quả: *{prev_label}*\n"
+        f"🎴 Cầu gần: `{seq_display}`\n\n"
+        f"{sep}\n"
+        f"🕒 {now}\n"
+        f"{'🟢 *AI ĐANG HOẠT ĐỘNG*' if is_ready else '🔴 *ĐANG CHỜ DỮ LIỆU*'}"
+    )
+
+def new_bac_session(chat_id, ban_id, auto_mode=False):
+    return {
+        "active":         True,
+        "auto_mode":      auto_mode,
+        "game":           "baccarat",
+        "chat_id":        chat_id,
+        "message_id":     None,
+        "bac_ban":        ban_id,
+        "bac_prev_result": "",
+        "bac_prev_seq":   "",
+        "bac_known_seq":  None,
+        "last_predict":   None,
+    }
+
+# ── Show game area (updated) ──────────────────────────────────────────────────
+
+async def show_baccarat_tables(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hiển thị danh sách tất cả bàn Baccarat."""
+    uid   = update.effective_user.id
+    uname = update.effective_user.username or ""
+    ensure_user(uid, uname)
+    if not user_data[uid].get("key"):
+        if hasattr(update, "callback_query") and update.callback_query:
+            await update.callback_query.edit_message_text(
+                "❌ *Bạn chưa có KEY VIP!*\n\nMua key tại mục `🔑 MUA GÓI KEY`.",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                "❌ *Bạn chưa có KEY VIP!*\n\nMua key tại mục `🔑 MUA GÓI KEY`.",
+                parse_mode="Markdown"
+            )
+        return
+
+    tables = fetch_baccarat_all()
+    if not tables:
+        query = getattr(update, "callback_query", None)
+        txt = "❌ Không lấy được danh sách bàn. Thử lại sau."
+        if query: await query.edit_message_text(txt)
+        else: await update.message.reply_text(txt)
+        return
+
+    rows = []
+    sorted_tables = sorted(tables.keys())
+    for i in range(0, len(sorted_tables), 3):
+        row = []
+        for ban_id in sorted_tables[i:i+3]:
+            info = tables[ban_id]
+            status = "✅" if info.get("trang_thai") == "Thành công" else "⚠️"
+            row.append(InlineKeyboardButton(
+                f"{status} {ban_id}",
+                callback_data=f"bac_ban_{ban_id}"
+            ))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")])
+
+    text = f"🃏 *BACCARAT — CHỌN BÀN*\n\n✅ Đang hoạt động  ⚠️ Chưa có dữ liệu\n\nTổng: *{len(tables)} bàn*"
+    query = getattr(update, "callback_query", None)
+    if query:
+        await query.edit_message_text(text, parse_mode="Markdown",
+                                       reply_markup=InlineKeyboardMarkup(rows))
+    else:
+        await update.message.reply_text(text, parse_mode="Markdown",
+                                         reply_markup=InlineKeyboardMarkup(rows))
+
+async def cb_bac_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User chọn 1 bàn cụ thể."""
+    query  = update.callback_query
+    await query.answer()
+    uid    = update.effective_user.id
+    uname  = update.effective_user.username or ""
+    ensure_user(uid, uname)
+    ban_id = query.data.replace("bac_ban_", "")
+
+    if not user_data[uid].get("key"):
+        await query.edit_message_text(
+            "❌ *Bạn chưa có KEY VIP!*", parse_mode="Markdown"
+        )
+        return
+
+    await query.edit_message_text(f"✅ Đang khởi động bàn *{ban_id}*...", parse_mode="Markdown")
+
+    async def send_fn(text, kb):
+        return await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text, reply_markup=kb, parse_mode="Markdown"
+        )
+    await _launch_baccarat(uid, query.message.chat_id, context, send_fn, ban_id, auto_mode=False)
+
+async def _launch_baccarat(uid, chat_id, context, send_fn, ban_id, auto_mode=False):
+    """Khởi động session Baccarat cho 1 bàn."""
+    _cancel_job(context, uid)
+    session = new_bac_session(chat_id, ban_id, auto_mode=auto_mode)
+    user_sessions[uid] = session
+
+    ban_data = fetch_baccarat_ban(ban_id)
+    predict  = None
+    if ban_data:
+        ket_qua = ban_data.get("ket_qua","")
+        session["bac_prev_seq"]    = ket_qua
+        session["bac_known_seq"]   = ket_qua
+        session["bac_prev_result"] = ket_qua[-1] if ket_qua else ""
+        predict = baccarat_predict_local(
+            ket_qua,
+            ban_data.get("du_doan","B"),
+            ban_data.get("do_tin_cay", 50)
+        )
+    session["last_predict"] = predict
+
+    kb   = BAC_AUTO_KB if auto_mode else BAC_GAME_KB
+    text = build_bac_ui(session, predict)
+    msg  = await send_fn(text, kb)
+    session["message_id"] = msg.message_id
+    session["chat_id"]    = msg.chat_id
+
+    if context.job_queue:
+        context.job_queue.run_repeating(
+            bac_auto_job,
+            interval=2,
+            first=2,
+            name=f"auto_{uid}",
+            user_id=uid,
+        )
+
+async def bac_auto_job(context: ContextTypes.DEFAULT_TYPE):
+    """Poll API mỗi 2s, gửi tin mới khi cầu thay đổi."""
+    uid     = context.job.user_id
+    session = user_sessions.get(uid)
+    if not session or not session.get("active") or session.get("game") != "baccarat":
+        context.job.schedule_removal()
+        return
+
+    ban_id    = session.get("bac_ban")
+    auto_mode = session.get("auto_mode", False)
+    kb        = BAC_AUTO_KB if auto_mode else BAC_GAME_KB
+
+    ban_data = fetch_baccarat_ban(ban_id)
+    if not ban_data:
+        return
+
+    ket_qua     = ban_data.get("ket_qua","")
+    known_seq   = session.get("bac_known_seq")
+    is_new      = (known_seq is not None and ket_qua != known_seq and len(ket_qua) > len(known_seq or ""))
+
+    if is_new:
+        session["bac_prev_result"] = ket_qua[-1] if ket_qua else ""
+        session["bac_prev_seq"]    = ket_qua
+        session["bac_known_seq"]   = ket_qua
+
+        predict = baccarat_predict_local(
+            ket_qua,
+            ban_data.get("du_doan","B"),
+            ban_data.get("do_tin_cay", 50)
+        )
+        session["last_predict"] = predict
+        text = build_bac_ui(session, predict)
+        try:
+            msg = await context.bot.send_message(
+                chat_id=session["chat_id"],
+                text=text, reply_markup=kb, parse_mode="Markdown"
+            )
+            session["message_id"] = msg.message_id
+            log.info(f"Baccarat uid={uid} ban={ban_id} gửi dự đoán mới")
+        except Exception as e:
+            log.error(f"bac_auto_job send lỗi uid={uid}: {e}")
+    else:
+        if known_seq is None:
+            session["bac_known_seq"] = ket_qua
+        text = build_bac_ui(session, session.get("last_predict"))
+        try:
+            await context.bot.edit_message_text(
+                text,
+                chat_id=session["chat_id"],
+                message_id=session["message_id"],
+                reply_markup=kb,
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                log.error(f"bac_auto_job edit lỗi uid={uid}: {e}")
+
+async def do_start_auto_bac(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
+    session = user_sessions.get(uid)
+    if not session or session.get("game") != "baccarat":
+        await update.message.reply_text("⚠️ Vui lòng chọn bàn Baccarat trước.", parse_mode="Markdown")
+        return
+    ban_id = session.get("bac_ban","---")
+    await update.message.reply_text(
+        f"🤖 *AUTO BAC đã bật!*\n\nBàn: *{ban_id}*\nBot tự gửi dự đoán mỗi khi có kết quả mới.",
+        parse_mode="Markdown", reply_markup=BAC_AUTO_KB
+    )
+    async def send_fn(text, kb):
+        return await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+    await _launch_baccarat(uid, update.message.chat_id, context, send_fn, ban_id, auto_mode=True)
+
+async def do_stop_bac(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
+    _deactivate(uid); _cancel_job(context, uid)
+    await update.message.reply_text(
+        "⏹ *Đã dừng dự đoán Baccarat.*",
+        parse_mode="Markdown", reply_markup=BAC_GAME_KB
+    )
+
+async def do_stop_auto_bac(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
+    _deactivate(uid); _cancel_job(context, uid)
+    await update.message.reply_text(
+        "⏹ *Đã dừng AUTO Baccarat.*",
+        parse_mode="Markdown", reply_markup=BAC_GAME_KB
+    )
+
 # ===== MAIN =====
 def main():
     # Validate token trước khi chạy
@@ -814,6 +1248,9 @@ def main():
     app.add_handler(CallbackQueryHandler(buy_key,             pattern="^buykey_"))
     app.add_handler(CallbackQueryHandler(tan_thu_used_notice, pattern="^tan_thu_used$"))
     app.add_handler(CallbackQueryHandler(generate_qr,         pattern="^nap_"))
+    # Baccarat handlers
+    app.add_handler(CallbackQueryHandler(show_baccarat_tables, pattern="^game_baccarat$"))
+    app.add_handler(CallbackQueryHandler(cb_bac_ban,           pattern="^bac_ban_"))
 
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
