@@ -1226,6 +1226,57 @@ async def do_stop_auto_bac(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         parse_mode="Markdown", reply_markup=BAC_GAME_KB
     )
 
+# ===== BROADCAST =====
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin: /broadcast <nội dung> — gửi thông báo đến tất cả user."""
+    uid   = update.effective_user.id
+    uname = update.effective_user.username or ""
+    if not is_admin(uid, uname):
+        await update.message.reply_text("❌ Chỉ admin mới dùng được lệnh này.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "📋 *Cú pháp:* /broadcast Nội dung thông báo\n"
+            "Ví dụ: /broadcast Hệ thống bảo trì 30 phút, vui lòng chờ!",
+            parse_mode="Markdown"
+        )
+        return
+
+    content = " ".join(context.args)
+    now     = datetime.now().strftime("%d/%m/%Y %H:%M")
+    sep     = "\u2501" * 22
+    text    = (
+        f"\U0001f4e2 *THONG BAO TU KANO AI*\n"
+        f"{sep}\n\n"
+        f"{content}\n\n"
+        f"{sep}\n"
+        f"\U0001f551 {now}"
+    )
+
+    # Gửi đến tất cả user đã từng dùng bot
+    all_uids = list(user_data.keys())
+    sent = 0; failed = 0
+    status_msg = await update.message.reply_text(
+        f"📤 Đang gửi đến {len(all_uids)} user...", parse_mode="Markdown"
+    )
+    for target_uid in all_uids:
+        try:
+            await context.bot.send_message(
+                chat_id=target_uid,
+                text=text,
+                parse_mode="Markdown"
+            )
+            sent += 1
+        except Exception as e:
+            log.warning(f"Broadcast fail uid={target_uid}: {e}")
+            failed += 1
+
+    await status_msg.edit_text(
+        f"Broadcast xong!\nDa gui: {sent}\nThat bai: {failed}\nTong: {len(all_uids)}",
+        parse_mode="Markdown"
+    )
+
 # ===== MAIN =====
 def main():
     # Validate token trước khi chạy
@@ -1240,7 +1291,8 @@ def main():
 
     app.add_handler(CommandHandler("start",   start))
     app.add_handler(CommandHandler("active",  cmd_active))
-    app.add_handler(CommandHandler("naptien", cmd_naptien))
+    app.add_handler(CommandHandler("naptien",    cmd_naptien))
+    app.add_handler(CommandHandler("broadcast",  cmd_broadcast))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
     app.add_handler(CallbackQueryHandler(cb_game_betvip,      pattern="^game_betvip$"))
