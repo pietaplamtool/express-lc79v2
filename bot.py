@@ -49,6 +49,73 @@ def self_ping():
 # FIX: Token mới — token cũ đã bị lộ, revoke ngay trên BotFather
 TOKEN          = os.environ.get("BOT_TOKEN", "PASTE_TOKEN_MOI_VAO_ENV_RENDER")
 PREDICT_URL    = "https://bettv-predictor.onrender.com/predict"
+
+# ===== SUPABASE =====
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://kjzsmyedbtdjgmvxyhru.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtqenNteWVkYnRkamdtdnh5aHJ1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkxNTUyOTEsImV4cCI6MjEwNDczMTI5MX0.zQ3vctfGAYbpqHarwxO6GawKoI3HGAZnDddn_UElzSA")
+_SB_HEADERS = {
+    "apikey":        SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type":  "application/json",
+    "Prefer":        "resolution=merge-duplicates,return=minimal",
+}
+
+def _sb_upsert_user(uid: int, username: str, first_name: str, extra: dict = None):
+    """Upsert user vào Supabase. Gọi sau mỗi /start và mỗi lần update thông tin."""
+    import urllib.request, json as _json
+    payload = {
+        "uid":        uid,
+        "username":   username or "",
+        "first_name": first_name or "",
+        "last_seen":  datetime.utcnow().isoformat() + "Z",
+    }
+    if extra:
+        payload.update(extra)
+    try:
+        req = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/users",
+            data=_json.dumps(payload).encode(),
+            headers=_SB_HEADERS,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            pass
+    except Exception as e:
+        log.warning(f"Supabase upsert lỗi uid={uid}: {e}")
+
+def _sb_get_all_uids() -> list[int]:
+    """Lấy tất cả uid từ Supabase để broadcast."""
+    import urllib.request, json as _json
+    try:
+        headers = dict(_SB_HEADERS)
+        headers["Prefer"] = ""
+        req = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/users?select=uid&limit=10000",
+            headers=headers,
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            rows = _json.loads(r.read())
+        return [row["uid"] for row in rows if "uid" in row]
+    except Exception as e:
+        log.warning(f"Supabase get_all_uids lỗi: {e}")
+        return []
+
+def _sb_update_user(uid: int, fields: dict):
+    """Update specific fields cho user trong Supabase."""
+    import urllib.request, json as _json
+    try:
+        headers = dict(_SB_HEADERS)
+        headers["Prefer"] = "return=minimal"
+        req = urllib.request.Request(
+            f"{SUPABASE_URL}/rest/v1/users?uid=eq.{uid}",
+            data=_json.dumps(fields).encode(),
+            headers=headers,
+            method="PATCH",
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            pass
+    except Exception as e:
+        log.warning(f"Supabase update lỗi uid={uid}: {e}")
 HISTORY_URL    = (
     "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
     "?cp=R&cl=R&pf=web&at=1fc7bfdeab18790088a6e44d6b8cb288&limit=10"
@@ -171,6 +238,24 @@ def _deactivate(uid):
     if uid in user_sessions:
         user_sessions[uid]["active"] = False
 
+def _sb_sync_user(uid: int):
+    """Đồng bộ trạng thái user hiện tại lên Supabase."""
+    d = user_data.get(uid)
+    if not d:
+        return
+    uname = ""
+    for info in ADMINS.values():
+        pass
+    fields = {
+        "balance":      d.get("balance", 0),
+        "key_code":     d.get("key"),
+        "key_expiry":   d.get("key_expiry"),
+        "tan_thu_used": d.get("tan_thu_used", False),
+        "used":         d.get("used", 0),
+        "last_seen":    datetime.utcnow().isoformat() + "Z",
+    }
+    threading.Thread(target=_sb_update_user, args=(uid, fields), daemon=True).start()
+
 # ===== API =====
 def fetch_predict():
     try:
@@ -282,9 +367,16 @@ def new_session(chat_id, auto_mode=False):
 
 # ===== /START =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    uname = update.effective_user.username or ""
+    uid        = update.effective_user.id
+    uname      = update.effective_user.username or ""
+    first_name = update.effective_user.first_name or ""
     ensure_user(uid, uname)
+    # Lưu user vào Supabase (tự động tạo mới hoặc cập nhật)
+    threading.Thread(
+        target=_sb_upsert_user,
+        args=(uid, uname, first_name),
+        daemon=True,
+    ).start()
     await update.message.reply_text(
         WELCOME_TEXT, parse_mode="Markdown", reply_markup=MENU_KB
     )
@@ -619,6 +711,7 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration = "Vĩnh viễn"       if admin else pkg["duration"]
     user_data[uid]["key"]        = new_key
     user_data[uid]["key_expiry"] = duration
+    _sb_sync_user(uid)   # đồng bộ key mới lên Supabase
 
     price_str    = "Miễn phí" if pkg["price"] == 0 else f"{pkg['price']:,}đ"
     one_time_note = "\n⚠️ *Gói này chỉ dùng được 1 lần.*" if pkg.get("one_time") and not admin else ""
@@ -756,6 +849,7 @@ async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_data[target_uid]["balance"] += amount
     new_balance = user_data[target_uid]["balance"]
+    _sb_sync_user(target_uid)   # đồng bộ balance lên Supabase
 
     await update.message.reply_text(
         f"╔══════════════════════╗\n"
@@ -1254,8 +1348,10 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\U0001f551 {now}"
     )
 
-    # Gửi đến tất cả user đã từng dùng bot
-    all_uids = list(user_data.keys())
+    # Gửi đến tất cả user từ Supabase (bao gồm cả user cũ)
+    sb_uids  = _sb_get_all_uids()
+    mem_uids = list(user_data.keys())
+    all_uids = list(set(sb_uids + mem_uids))
     sent = 0; failed = 0
     status_msg = await update.message.reply_text(
         f"📤 Đang gửi đến {len(all_uids)} user...", parse_mode="Markdown"
