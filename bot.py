@@ -120,6 +120,10 @@ HISTORY_URL    = (
     "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
     "?cp=R&cl=R&pf=web&at=1fc7bfdeab18790088a6e44d6b8cb288&limit=10"
 )
+LC79_URL = (
+    "https://wtxmd52.tele68.com/v1/txmd5/sessions"
+    "?cp=R&cl=R&pf=web&at=3db23f93a0836eb5ed8f92428de0b266&limit=10"
+)
 FEEDBACK_LINK  = "https://t.me/feedbackkanoai_2026"
 THONGBAO_LINK  = "https://t.me/thongbaokanoai_2026"
 
@@ -407,6 +411,15 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "⏹ DỪNG AUTO BAC":
         await do_stop_auto_bac(update, context, uid)
         return
+    if text == "⏹ DỪNG DỰ ĐOÁN LC79":
+        await do_stop_lc79(update, context, uid)
+        return
+    if text == "🤖 BẬT AUTO LC79":
+        await do_start_auto_lc79(update, context, uid)
+        return
+    if text == "⏹ DỪNG AUTO LC79":
+        await do_stop_auto_lc79(update, context, uid)
+        return
     if text == "🔙 QUAY LẠI MENU":
         _deactivate(uid)
         _cancel_job(context, uid)
@@ -438,8 +451,9 @@ async def show_game_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("⭐ BetVip Tài/Xỉu", callback_data="game_betvip")],
-            [InlineKeyboardButton("🃏 Baccarat", callback_data="game_baccarat")],
-            [InlineKeyboardButton("🔙 Quay lại", callback_data="back_main")],
+            [InlineKeyboardButton("🎯 LC79 Tài/Xỉu",   callback_data="game_lc79")],
+            [InlineKeyboardButton("🃏 Baccarat",         callback_data="game_baccarat")],
+            [InlineKeyboardButton("🔙 Quay lại",         callback_data="back_main")],
         ])
     )
 
@@ -1320,6 +1334,252 @@ async def do_stop_auto_bac(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         parse_mode="Markdown", reply_markup=BAC_GAME_KB
     )
 
+# ===== LC79 TÀI/XỈU =====
+
+LC79_GAME_KB = ReplyKeyboardMarkup([
+    ["⏹ DỪNG DỰ ĐOÁN LC79"],
+    ["🤖 BẬT AUTO LC79"],
+    ["🔙 QUAY LẠI MENU"],
+], resize_keyboard=True)
+
+LC79_AUTO_KB = ReplyKeyboardMarkup([
+    ["⏹ DỪNG AUTO LC79"],
+    ["🔙 QUAY LẠI MENU"],
+], resize_keyboard=True)
+
+lc79_sessions = {}   # uid -> session dict
+
+def fetch_lc79_sessions():
+    pass  # unused, kept for compatibility
+
+def fetch_lc79():
+    """Lấy lịch sử phiên LC79."""
+    try:
+        import urllib.request as _ur, json as _j
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+            "Accept": "application/json",
+        }
+        req = _ur.Request(LC79_URL, headers=headers)
+        with _ur.urlopen(req, timeout=8) as r:
+            data = _j.loads(r.read())
+        return data.get("list", [])
+    except Exception as e:
+        log.warning(f"fetch_lc79 loi: {e}")
+        return []
+
+def build_lc79_ui(session, predict_data):
+    """Giao diện dự đoán LC79 — giống BetVip."""
+    now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    sep = "━" * 22
+    auto_tag = "🤖 AUTO · " if session.get("auto_mode") else ""
+
+    has_prediction = (
+        predict_data is not None
+        and predict_data.get("label") in ("T", "X")
+        and predict_data.get("history_len", 0) > 0
+    )
+    if has_prediction:
+        prev = session.get("prev_session", "---")
+        try:
+            target_id = str(int(prev) + 1)
+        except (ValueError, TypeError):
+            target_id = "---"
+        pred_label, pred_emoji = label_result(predict_data.get("label", ""))
+        conf = predict_data.get("confidence_pct", 0.0)
+        is_ready = True
+    else:
+        target_id = "---"
+        pred_label = "Dang cho du lieu"
+        pred_emoji = "⏳"
+        conf = 0.0
+        is_ready = False
+
+    bar = "▰" * int(conf / 100 * 12) + "▱" * (12 - int(conf / 100 * 12))
+    prev_label, prev_emoji = label_result(session["prev_result"])
+    prev_dices = session.get("prev_dices")
+    prev_point = session.get("prev_point")
+    dice_line = ""
+    if prev_dices and len(prev_dices) == 3:
+        dice_line = f"\n🎲 {prev_dices[0]} · {prev_dices[1]} · {prev_dices[2]}   Tong: *{prev_point}*"
+
+    status = "🟢 *AI DANG HOAT DONG*" if is_ready else "🔴 *DANG CHO DU LIEU*"
+    return (
+        f"╔══════════════════════╗\n"
+        f"   {auto_tag}🎯 *KANO AI* · LC79\n"
+        f"╚══════════════════════╝\n\n"
+        f"{sep}\n"
+        f"📡 *DU DOAN*\n"
+        f"{sep}\n"
+        f"🔢 Phien:   `#{target_id}`\n"
+        f"{pred_emoji} Ket qua:  *{pred_label}*\n\n"
+        f"📊 *DO TIN CAY*\n"
+        f"`{bar}` *{conf:.1f}%*\n\n"
+        f"{sep}\n"
+        f"📜 *PHIEN TRUOC*\n"
+        f"{sep}\n"
+        f"🔢 Phien:   `#{session['prev_session']}`\n"
+        f"{prev_emoji} Ket qua:  *{prev_label}*"
+        f"{dice_line}\n\n"
+        f"{sep}\n"
+        f"🕐 {now}\n"
+        f"{status}"
+    )
+
+async def _launch_lc79(uid, chat_id, context, send_fn, auto_mode=False):
+    """Khoi dong session LC79."""
+    _cancel_job(context, uid)
+    session = {
+        "active": True, "auto_mode": auto_mode, "chat_id": chat_id,
+        "message_id": None, "prev_session": "---", "prev_result": "---",
+        "prev_dices": None, "prev_point": None,
+        "known_latest": None, "last_predict": None,
+    }
+    lc79_sessions[uid] = session
+
+    sessions = fetch_lc79()
+    if sessions:
+        finished = get_latest_finished(sessions)
+        if finished:
+            session["known_latest"] = finished.get("id")
+            session["prev_session"] = str(finished.get("id", "---"))
+            session["prev_result"]  = finished.get("resultTruyenThong") or "---"
+            session["prev_dices"]   = finished.get("dices")
+            session["prev_point"]   = finished.get("point")
+
+    predict_data = fetch_predict()
+    if predict_data and "confidence_pct" not in predict_data:
+        c = float(predict_data.get("confidence", 0))
+        predict_data["confidence_pct"] = round(c * 100 if c <= 1.0 else c, 1)
+    session["last_predict"] = predict_data
+
+    kb = LC79_AUTO_KB if auto_mode else LC79_GAME_KB
+    text = build_lc79_ui(session, predict_data)
+    msg = await send_fn(text, kb)
+    session["message_id"] = msg.message_id
+    session["chat_id"] = msg.chat_id
+
+    if context.job_queue:
+        context.job_queue.run_repeating(
+            lc79_auto_job, interval=2, first=2,
+            name=f"auto_{uid}", user_id=uid,
+        )
+
+async def lc79_auto_job(context):
+    """Poll LC79 API moi 2 giay."""
+    uid = context.job.user_id
+    session = lc79_sessions.get(uid)
+    if not session or not session["active"]:
+        context.job.schedule_removal()
+        return
+
+    kb = LC79_AUTO_KB if session.get("auto_mode") else LC79_GAME_KB
+    sessions = fetch_lc79()
+    if not sessions:
+        return
+    finished = get_latest_finished(sessions)
+    if not finished:
+        return
+
+    current_latest = finished.get("id")
+    known_latest = session.get("known_latest")
+    is_new = (
+        current_latest is not None
+        and known_latest is not None
+        and current_latest != known_latest
+    )
+
+    if is_new:
+        session["prev_session"] = str(current_latest)
+        session["prev_result"]  = finished.get("resultTruyenThong") or "---"
+        session["prev_dices"]   = finished.get("dices")
+        session["prev_point"]   = finished.get("point")
+        session["known_latest"] = current_latest
+
+        predict_data = fetch_predict()
+        if not predict_data:
+            return
+        if "confidence_pct" not in predict_data:
+            c = float(predict_data.get("confidence", 0))
+            predict_data["confidence_pct"] = round(c * 100 if c <= 1.0 else c, 1)
+        session["last_predict"] = predict_data
+        text = build_lc79_ui(session, predict_data)
+        try:
+            msg = await context.bot.send_message(
+                chat_id=session["chat_id"], text=text,
+                reply_markup=kb, parse_mode="Markdown",
+            )
+            session["message_id"] = msg.message_id
+        except Exception as e:
+            log.error(f"lc79_auto_job send loi uid={uid}: {e}")
+    else:
+        if known_latest is None and current_latest is not None:
+            session["known_latest"] = current_latest
+        text = build_lc79_ui(session, session["last_predict"])
+        try:
+            await context.bot.edit_message_text(
+                text, chat_id=session["chat_id"],
+                message_id=session["message_id"],
+                reply_markup=kb, parse_mode="Markdown",
+            )
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                log.error(f"lc79_auto_job edit loi uid={uid}: {e}")
+
+async def cb_game_lc79(update, context):
+    query = update.callback_query
+    await query.answer()
+    uid = update.effective_user.id
+    uname = update.effective_user.username or ""
+    ensure_user(uid, uname)
+    if not user_data[uid].get("key"):
+        await query.edit_message_text(
+            "❌ *Ban chua co KEY VIP!*\n\nMua key tai muc `🔑 MUA GOI KEY`.",
+            parse_mode="Markdown"
+        )
+        return
+    await query.edit_message_text("✅ Dang khoi dong LC79...")
+    async def send_fn(text, kb):
+        return await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=text, reply_markup=kb, parse_mode="Markdown"
+        )
+    await _launch_lc79(uid, query.message.chat_id, context, send_fn, auto_mode=False)
+
+async def do_stop_lc79(update, context, uid):
+    if uid in lc79_sessions:
+        lc79_sessions[uid]["active"] = False
+    _cancel_job(context, uid)
+    await update.message.reply_text(
+        "⏹ *Da dung du doan LC79.*",
+        parse_mode="Markdown", reply_markup=LC79_GAME_KB
+    )
+
+async def do_start_auto_lc79(update, context, uid):
+    uname = update.effective_user.username or ""
+    ensure_user(uid, uname)
+    if not user_data[uid].get("key"):
+        await update.message.reply_text(
+            "❌ *Ban chua co KEY VIP!*", parse_mode="Markdown"
+        )
+        return
+    await update.message.reply_text(
+        "🤖 *AUTO LC79 da bat!*\n\nBot se tu dong gui du doan moi khi co ket qua moi.",
+        parse_mode="Markdown", reply_markup=LC79_AUTO_KB
+    )
+    async def send_fn(text, kb):
+        return await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
+    await _launch_lc79(uid, update.message.chat_id, context, send_fn, auto_mode=True)
+
+async def do_stop_auto_lc79(update, context, uid):
+    if uid in lc79_sessions:
+        lc79_sessions[uid]["active"] = False
+    _cancel_job(context, uid)
+    await update.message.reply_text(
+        "⏹ *Da dung AUTO LC79.*",
+        parse_mode="Markdown", reply_markup=LC79_GAME_KB
+    )
+
 # ===== BROADCAST =====
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin: /broadcast <nội dung> — gửi thông báo đến tất cả user."""
@@ -1392,6 +1652,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
     app.add_handler(CallbackQueryHandler(cb_game_betvip,      pattern="^game_betvip$"))
+    app.add_handler(CallbackQueryHandler(cb_game_lc79,        pattern="^game_lc79$"))
     app.add_handler(CallbackQueryHandler(back_main,           pattern="^back_main$"))
     app.add_handler(CallbackQueryHandler(buy_key,             pattern="^buykey_"))
     app.add_handler(CallbackQueryHandler(tan_thu_used_notice, pattern="^tan_thu_used$"))
