@@ -21,17 +21,10 @@ def health():
     return "Kano AI Bot is running.", 200
 
 def run_flask():
-    # FIX: dùng PORT+1 để tránh conflict với gunicorn trên cùng PORT
-    # Bot chạy bằng `python bot.py` nên gunicorn không can thiệp.
-    # PORT vẫn dùng được vì bot.py tự chạy Flask, không qua gunicorn.
     port = int(os.environ.get("PORT", 8080))
     flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 def self_ping():
-    """
-    Ping cả 2 service mỗi 4 phút để Render Free không spin down.
-    Render Free spin down sau 15 phút không có request.
-    """
     import time as _t
     _t.sleep(30)
     bot_url      = BOT_URL or "https://bettv-telegram-bot.onrender.com"
@@ -46,7 +39,6 @@ def self_ping():
         _t.sleep(240)
 
 # ===== CẤU HÌNH =====
-# FIX: Token mới — token cũ đã bị lộ, revoke ngay trên BotFather
 TOKEN          = os.environ.get("BOT_TOKEN", "PASTE_TOKEN_MOI_VAO_ENV_RENDER")
 PREDICT_URL    = "https://bettv-predictor.onrender.com/predict"
 
@@ -61,7 +53,6 @@ _SB_HEADERS = {
 }
 
 def _sb_upsert_user(uid: int, username: str, first_name: str, extra: dict = None):
-    """Upsert user vào Supabase. Gọi sau mỗi /start và mỗi lần update thông tin."""
     import urllib.request, json as _json
     payload = {
         "uid":        uid,
@@ -84,7 +75,6 @@ def _sb_upsert_user(uid: int, username: str, first_name: str, extra: dict = None
         log.warning(f"Supabase upsert lỗi uid={uid}: {e}")
 
 def _sb_get_all_uids() -> list[int]:
-    """Lấy tất cả uid từ Supabase để broadcast."""
     import urllib.request, json as _json
     try:
         headers = dict(_SB_HEADERS)
@@ -101,7 +91,6 @@ def _sb_get_all_uids() -> list[int]:
         return []
 
 def _sb_update_user(uid: int, fields: dict):
-    """Update specific fields cho user trong Supabase."""
     import urllib.request, json as _json
     try:
         headers = dict(_SB_HEADERS)
@@ -116,6 +105,7 @@ def _sb_update_user(uid: int, fields: dict):
             pass
     except Exception as e:
         log.warning(f"Supabase update lỗi uid={uid}: {e}")
+
 HISTORY_URL    = (
     "https://wtxmd52.macminim6.online/v1/txmd5/sessions"
     "?cp=R&cl=R&pf=web&at=1fc7bfdeab18790088a6e44d6b8cb288&limit=10"
@@ -243,13 +233,9 @@ def _deactivate(uid):
         user_sessions[uid]["active"] = False
 
 def _sb_sync_user(uid: int):
-    """Đồng bộ trạng thái user hiện tại lên Supabase."""
     d = user_data.get(uid)
     if not d:
         return
-    uname = ""
-    for info in ADMINS.values():
-        pass
     fields = {
         "balance":      d.get("balance", 0),
         "key_code":     d.get("key"),
@@ -301,14 +287,12 @@ def build_ui(session, predict_data):
     sep = "━" * 22
     auto_tag = "🤖 AUTO · " if session.get("auto_mode") else ""
 
-    # FIX: engine mới trả label trực tiếp, không dùng status==PREDICT
     has_prediction = (
         predict_data is not None
         and predict_data.get("label") in ("T", "X")
         and predict_data.get("history_len", 0) > 0
     )
     if has_prediction:
-        # Phiên tiếp theo = phiên trước + 1
         prev = session.get("prev_session", "---")
         try:
             target_id = str(int(prev) + 1)
@@ -375,7 +359,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uname      = update.effective_user.username or ""
     first_name = update.effective_user.first_name or ""
     ensure_user(uid, uname)
-    # Lưu user vào Supabase (tự động tạo mới hoặc cập nhật)
     threading.Thread(
         target=_sb_upsert_user,
         args=(uid, uname, first_name),
@@ -401,7 +384,6 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "⏹ DỪNG AUTO":
         await do_stop_auto(update, context, uid)
         return
-    # Baccarat buttons
     if text == "⏹ DỪNG DỰ ĐOÁN BAC":
         await do_stop_bac(update, context, uid)
         return
@@ -560,7 +542,7 @@ async def do_stop_auto(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: 
         reply_markup=GAME_KB
     )
 
-# ===== AUTO JOB =====
+# ===== AUTO JOB (ĐÃ SỬA LỖI MESSAGE CAN'T BE EDITED) =====
 async def auto_predict_job(context: ContextTypes.DEFAULT_TYPE):
     uid     = context.job.user_id
     session = user_sessions.get(uid)
@@ -596,11 +578,9 @@ async def auto_predict_job(context: ContextTypes.DEFAULT_TYPE):
         session["known_latest"] = current_latest
 
         predict_data = fetch_predict()
-        # Engine mới trả label trực tiếp, không có status field
         if not predict_data:
             log.info(f"uid={uid} phiên mới={current_latest} nhưng predict API lỗi")
             return
-        # Chuyển confidence sang % nếu chưa có confidence_pct
         if "confidence_pct" not in predict_data and "confidence" in predict_data:
             c = float(predict_data.get("confidence", 0))
             predict_data["confidence_pct"] = round(c * 100 if c <= 1.0 else c, 1)
@@ -633,7 +613,23 @@ async def auto_predict_job(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
         except Exception as e:
-            if "not modified" not in str(e).lower():
+            err_str = str(e).lower()
+            if "not modified" in err_str:
+                pass  # Bỏ qua lỗi không thay đổi nội dung
+            elif "message can't be edited" in err_str or "message to edit not found" in err_str:
+                # Không edit được -> gửi tin nhắn mới
+                try:
+                    msg = await context.bot.send_message(
+                        chat_id=session["chat_id"],
+                        text=text,
+                        reply_markup=kb,
+                        parse_mode="Markdown",
+                    )
+                    session["message_id"] = msg.message_id
+                    log.info(f"uid={uid} gửi tin mới do không edit được")
+                except Exception as e2:
+                    log.error(f"auto_predict_job send fallback lỗi uid={uid}: {e2}")
+            else:
                 log.error(f"auto_predict_job edit lỗi uid={uid}: {e}")
 
 # ===== INLINE CALLBACKS =====
@@ -725,7 +721,7 @@ async def buy_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     duration = "Vĩnh viễn"       if admin else pkg["duration"]
     user_data[uid]["key"]        = new_key
     user_data[uid]["key_expiry"] = duration
-    _sb_sync_user(uid)   # đồng bộ key mới lên Supabase
+    _sb_sync_user(uid)
 
     price_str    = "Miễn phí" if pkg["price"] == 0 else f"{pkg['price']:,}đ"
     one_time_note = "\n⚠️ *Gói này chỉ dùng được 1 lần.*" if pkg.get("one_time") and not admin else ""
@@ -863,7 +859,7 @@ async def cmd_naptien(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_data[target_uid]["balance"] += amount
     new_balance = user_data[target_uid]["balance"]
-    _sb_sync_user(target_uid)   # đồng bộ balance lên Supabase
+    _sb_sync_user(target_uid)
 
     await update.message.reply_text(
         f"╔══════════════════════╗\n"
@@ -918,8 +914,6 @@ async def thongbao(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 BACCARAT_API_URL = "https://kkvgvbcrj.onrender.com/api/fullban"
 
-# ── Baccarat AI Engine ────────────────────────────────────────────────────────
-
 def _bac_safe(v):
     if v is None: return None
     s = str(v).strip().upper()
@@ -934,7 +928,6 @@ def _bac_entropy(counts):
 def _bac_clamp(v, lo, hi): return max(lo, min(hi, v))
 
 def _bac_bat_nhip(history):
-    """AI Bắt nhịp: phát hiện pattern lặp PBPB, BBPP..."""
     seq = [x for x in history if x != "T"]
     if len(seq) < 4: return "B", 0.5
     best_label = seq[-1]; best_score = 0.0
@@ -949,7 +942,6 @@ def _bac_bat_nhip(history):
     return best_label, _bac_clamp(best_score * 1.5, 0.3, 0.85)
 
 def _bac_theo_bet(history):
-    """AI Theo bệt: phát hiện streak và theo."""
     seq = [x for x in history if x != "T"]
     if not seq: return "B", 0.5
     current = seq[-1]; streak = 0
@@ -959,7 +951,6 @@ def _bac_theo_bet(history):
     return current, _bac_clamp(0.45 + streak * 0.06, 0.45, 0.82)
 
 def _bac_be_bet(history):
-    """AI Bẻ bệt: khi streak >= 4 dự đoán sẽ bẻ."""
     seq = [x for x in history if x != "T"]
     if len(seq) < 6: return "B", 0.5
     window = seq[-10:]; current = window[-1]; streak = 0
@@ -972,7 +963,6 @@ def _bac_be_bet(history):
     return current, 0.48
 
 def _bac_tie_prob(history):
-    """AI Tie: dự đoán xác suất Hòa."""
     if len(history) < 10: return 9.5
     window = list(history)[-30:]
     n = len(window)
@@ -985,10 +975,6 @@ def _bac_tie_prob(history):
     return round(tie_p * 100, 1)
 
 def baccarat_predict_local(history_str, api_du_doan, api_tin_cay):
-    """
-    Fuse: API signal (40%) + AI Bắt nhịp (20%) + AI Theo bệt (20%) + AI Bẻ bệt (20%).
-    Trả về dict label/confidence_pct/tie_prob_pct/signals.
-    """
     history = [_bac_safe(c) for c in history_str]
     history = [x for x in history if x is not None]
 
@@ -1025,10 +1011,7 @@ def baccarat_predict_local(history_str, api_du_doan, api_tin_cay):
         "signals":        {k: {"label": v[0], "conf_pct": round(v[1]*100,1)} for k,v in signals.items()},
     }
 
-# ── Baccarat API ──────────────────────────────────────────────────────────────
-
 def fetch_baccarat_all():
-    """Lấy toàn bộ dữ liệu tất cả bàn."""
     try:
         r = requests.get(BACCARAT_API_URL, timeout=10)
         r.raise_for_status()
@@ -1039,7 +1022,6 @@ def fetch_baccarat_all():
         return {}
 
 def fetch_baccarat_ban(ban_id):
-    """Lấy dữ liệu 1 bàn cụ thể."""
     try:
         r = requests.get(BACCARAT_API_URL, timeout=10)
         r.raise_for_status()
@@ -1048,8 +1030,6 @@ def fetch_baccarat_ban(ban_id):
     except Exception as e:
         log.warning(f"fetch_baccarat_ban {ban_id} lỗi: {e}")
         return None
-
-# ── Baccarat Keyboards ────────────────────────────────────────────────────────
 
 BAC_GAME_KB = ReplyKeyboardMarkup([
     ["⏹ DỪNG DỰ ĐOÁN BAC"],
@@ -1061,8 +1041,6 @@ BAC_AUTO_KB = ReplyKeyboardMarkup([
     ["⏹ DỪNG AUTO BAC"],
     ["🔙 QUAY LẠI MENU"],
 ], resize_keyboard=True)
-
-# ── Baccarat build_ui ─────────────────────────────────────────────────────────
 
 def label_bac(raw):
     raw = (raw or "").upper()
@@ -1139,10 +1117,7 @@ def new_bac_session(chat_id, ban_id, auto_mode=False):
         "last_predict":   None,
     }
 
-# ── Show game area (updated) ──────────────────────────────────────────────────
-
 async def show_baccarat_tables(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Hiển thị danh sách tất cả bàn Baccarat."""
     uid   = update.effective_user.id
     uname = update.effective_user.username or ""
     ensure_user(uid, uname)
@@ -1191,7 +1166,6 @@ async def show_baccarat_tables(update: Update, context: ContextTypes.DEFAULT_TYP
                                          reply_markup=InlineKeyboardMarkup(rows))
 
 async def cb_bac_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User chọn 1 bàn cụ thể."""
     query  = update.callback_query
     await query.answer()
     uid    = update.effective_user.id
@@ -1215,7 +1189,6 @@ async def cb_bac_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _launch_baccarat(uid, query.message.chat_id, context, send_fn, ban_id, auto_mode=False)
 
 async def _launch_baccarat(uid, chat_id, context, send_fn, ban_id, auto_mode=False):
-    """Khởi động session Baccarat cho 1 bàn."""
     _cancel_job(context, uid)
     session = new_bac_session(chat_id, ban_id, auto_mode=auto_mode)
     user_sessions[uid] = session
@@ -1250,7 +1223,6 @@ async def _launch_baccarat(uid, chat_id, context, send_fn, ban_id, auto_mode=Fal
         )
 
 async def bac_auto_job(context: ContextTypes.DEFAULT_TYPE):
-    """Poll API mỗi 2s, gửi tin mới khi cầu thay đổi."""
     uid     = context.job.user_id
     session = user_sessions.get(uid)
     if not session or not session.get("active") or session.get("game") != "baccarat":
@@ -1303,7 +1275,19 @@ async def bac_auto_job(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown",
             )
         except Exception as e:
-            if "not modified" not in str(e).lower():
+            err_str = str(e).lower()
+            if "not modified" in err_str:
+                pass
+            elif "message can't be edited" in err_str or "message to edit not found" in err_str:
+                try:
+                    msg = await context.bot.send_message(
+                        chat_id=session["chat_id"],
+                        text=text, reply_markup=kb, parse_mode="Markdown"
+                    )
+                    session["message_id"] = msg.message_id
+                except Exception as e2:
+                    log.error(f"bac_auto_job send fallback lỗi uid={uid}: {e2}")
+            else:
                 log.error(f"bac_auto_job edit lỗi uid={uid}: {e}")
 
 async def do_start_auto_bac(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int):
@@ -1347,13 +1331,9 @@ LC79_AUTO_KB = ReplyKeyboardMarkup([
     ["🔙 QUAY LẠI MENU"],
 ], resize_keyboard=True)
 
-lc79_sessions = {}   # uid -> session dict
-
-def fetch_lc79_sessions():
-    pass  # unused, kept for compatibility
+lc79_sessions = {}
 
 def fetch_lc79():
-    """Lấy lịch sử phiên LC79."""
     try:
         import urllib.request as _ur, json as _j
         headers = {
@@ -1369,7 +1349,6 @@ def fetch_lc79():
         return []
 
 def build_lc79_ui(session, predict_data):
-    """Giao diện dự đoán LC79 — giống BetVip."""
     now = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     sep = "━" * 22
     auto_tag = "🤖 AUTO · " if session.get("auto_mode") else ""
@@ -1427,7 +1406,6 @@ def build_lc79_ui(session, predict_data):
     )
 
 async def _launch_lc79(uid, chat_id, context, send_fn, auto_mode=False):
-    """Khoi dong session LC79."""
     _cancel_job(context, uid)
     session = {
         "active": True, "auto_mode": auto_mode, "chat_id": chat_id,
@@ -1466,7 +1444,6 @@ async def _launch_lc79(uid, chat_id, context, send_fn, auto_mode=False):
         )
 
 async def lc79_auto_job(context):
-    """Poll LC79 API moi 2 giay."""
     uid = context.job.user_id
     session = lc79_sessions.get(uid)
     if not session or not session["active"]:
@@ -1523,7 +1500,19 @@ async def lc79_auto_job(context):
                 reply_markup=kb, parse_mode="Markdown",
             )
         except Exception as e:
-            if "not modified" not in str(e).lower():
+            err_str = str(e).lower()
+            if "not modified" in err_str:
+                pass
+            elif "message can't be edited" in err_str or "message to edit not found" in err_str:
+                try:
+                    msg = await context.bot.send_message(
+                        chat_id=session["chat_id"], text=text,
+                        reply_markup=kb, parse_mode="Markdown",
+                    )
+                    session["message_id"] = msg.message_id
+                except Exception as e2:
+                    log.error(f"lc79_auto_job send fallback loi uid={uid}: {e2}")
+            else:
                 log.error(f"lc79_auto_job edit loi uid={uid}: {e}")
 
 async def cb_game_lc79(update, context):
@@ -1582,7 +1571,6 @@ async def do_stop_auto_lc79(update, context, uid):
 
 # ===== BROADCAST =====
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin: /broadcast <nội dung> — gửi thông báo đến tất cả user."""
     uid   = update.effective_user.id
     uname = update.effective_user.username or ""
     if not is_admin(uid, uname):
@@ -1608,7 +1596,6 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"\U0001f551 {now}"
     )
 
-    # Gửi đến tất cả user từ Supabase (bao gồm cả user cũ)
     sb_uids  = _sb_get_all_uids()
     mem_uids = list(user_data.keys())
     all_uids = list(set(sb_uids + mem_uids))
@@ -1635,7 +1622,6 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== MAIN =====
 def main():
-    # Validate token trước khi chạy
     token = os.environ.get("BOT_TOKEN", "")
     if not token or token == "PASTE_TOKEN_MOI_VAO_ENV_RENDER":
         raise RuntimeError(
@@ -1657,7 +1643,6 @@ def main():
     app.add_handler(CallbackQueryHandler(buy_key,             pattern="^buykey_"))
     app.add_handler(CallbackQueryHandler(tan_thu_used_notice, pattern="^tan_thu_used$"))
     app.add_handler(CallbackQueryHandler(generate_qr,         pattern="^nap_"))
-    # Baccarat handlers
     app.add_handler(CallbackQueryHandler(show_baccarat_tables, pattern="^game_baccarat$"))
     app.add_handler(CallbackQueryHandler(cb_bac_ban,           pattern="^bac_ban_"))
 
