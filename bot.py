@@ -40,7 +40,7 @@ def self_ping():
 
 # ===== CẤU HÌNH =====
 TOKEN          = os.environ.get("BOT_TOKEN", "PASTE_TOKEN_MOI_VAO_ENV_RENDER")
-PREDICT_URL    = "https://bettv-predictor.onrender.com/predict"
+PREDICT_URL    = "http://localhost:10000/predict"
 
 # ===== SUPABASE =====
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://kjzsmyedbtdjgmvxyhru.supabase.co")
