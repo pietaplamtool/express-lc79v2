@@ -248,17 +248,16 @@ def _sb_sync_user(uid: int):
 
 # ===== API =====
 def fetch_predict():
+    """Gọi hàm dự đoán trực tiếp từ app.py (không qua HTTP)."""
     try:
-        r = requests.get(PREDICT_URL, timeout=12)
-        r.raise_for_status()
-        data = r.json()
-        c = float(data.get("confidence", 0))
-        data["confidence_pct"] = round(c * 100 if c <= 1.0 else c, 1)
-        return data
+        from app import get_prediction_for_bot
+        data = get_prediction_for_bot()
+        if data and data.get("label") in ("T", "X"):
+            return data
+        return None
     except Exception as e:
         log.warning(f"fetch_predict lỗi: {e}")
         return None
-
 def fetch_game_sessions():
     try:
         r = requests.get(HISTORY_URL, timeout=8)
