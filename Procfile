@@ -1,1 +1,1 @@
-web: python app.py & python bot.py
+ web: python bot.py
