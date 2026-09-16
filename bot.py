@@ -40,7 +40,7 @@ def self_ping():
 
 # ===== CẤU HÌNH =====
 TOKEN          = os.environ.get("BOT_TOKEN", "PASTE_TOKEN_MOI_VAO_ENV_RENDER")
-PREDICT_URL    = "http://localhost:10000/predict"
+PREDICT_URL    = "https://kano-ai-f70ae.containers.snapdeploy.app/predict"
 
 # ===== SUPABASE =====
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://kjzsmyedbtdjgmvxyhru.supabase.co")
