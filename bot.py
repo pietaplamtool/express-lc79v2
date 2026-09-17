@@ -250,7 +250,7 @@ def _sb_sync_user(uid: int):
 def fetch_predict():
     """Gọi hàm dự đoán trực tiếp từ app.py (không qua HTTP)."""
     try:
-        from app import get_prediction_for_bot
+        from ai_core import get_prediction_for_bot
         data = get_prediction_for_bot()
         if data and data.get("label") in ("T", "X"):
             return data
