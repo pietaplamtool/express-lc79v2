@@ -945,32 +945,26 @@ def startup_initialize() -> None:
     else:
         initialize_from_environment()
 
-# ===== HÀM DỰ ĐOÁN CHO TELEGRAM BOT (KHÔNG QUA HTTP) =====
+# ===== HÀM DỰ ĐOÁN CHO TELEGRAM BOT =====
 def get_prediction_for_bot():
     """
-    Trả về dict dự đoán cho bot Telegram, không cần gọi HTTP.
+    Trả về dict dự đoán cho bot Telegram.
     Format: {"label": "T"/"X", "confidence_pct": float, "history_len": int}
     """
     try:
-        rows, seq = get_history()
-        if len(seq) < 100:
-            return {"label": None, "confidence_pct": 0.0, "history_len": len(seq)}
-
-        kb = ensure_cache(rows, seq)
-        experts = all_experts(seq, kb)
-        decision = supreme_review(seq, experts)
-
-        pred = decision["predicted"]
-        label = "T" if pred == "TAI" else "X"
-        conf = decision["confidence"]
-
+        result = predictor.predict()
+        label = result.get("label")
+        if label not in ("T", "X"):
+            return {"label": None, "confidence_pct": 0.0,
+                    "history_len": result.get("history_len", 0)}
+        conf = result.get("confidence", 0.5)
         return {
             "label": label,
             "confidence_pct": round(conf * 100, 1),
-            "history_len": len(seq),
+            "history_len": result.get("history_len", 0),
         }
     except Exception as e:
-        print(f"get_prediction_for_bot lỗi: {e}")
+        log.error(f"get_prediction_for_bot lỗi: {e}")
         return {"label": None, "confidence_pct": 0.0, "history_len": 0}
 
 # — Entrypoint —
